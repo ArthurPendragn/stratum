@@ -1,4 +1,5 @@
 from typing import Callable
+from collections.abc import Sequence
 from stratum.optimizer.ir._ops import (DATA_OP_PLACEHOLDER, BaseEstimatorOp, BinOp, CallOp, GetAttrOp, GetItemOp,
                                        MethodCallOp, Op, ValueOp, VariableOp,_resolve_args, _resolve_kwargs)
 from pandas import DataFrame
@@ -48,6 +49,48 @@ class DataSourceOp(Op):
 
     def clone(self):
         raise ValueError(f"We should not clone DataSourceOp objects.")
+
+class JoinOp(Op):
+    fields = ["how", "left_on", "right_on", "left_index", "right_index", "suffixes"]
+
+    def __init__(
+        self,
+        how: str = "inner",
+        left_on: str | list[str] | None = None,
+        right_on: str | list[str] | None = None,
+        left_index: bool = False,
+        right_index: bool = False,
+        suffixes: Sequence[str] = ("_x", "_y"),
+        inputs: list[Op] | None = None,
+        outputs: list[Op] | None = None,
+    ):
+        super().__init__(name="JOIN", inputs=inputs, outputs=outputs)
+        self.how = how
+        self.left_on = left_on
+        self.right_on = right_on
+        self.left_index = left_index
+        self.right_index = right_index
+        self.suffixes = suffixes
+        self.is_dataframe_op = True
+
+    def process(self, mode: str, environment: dict, inputs: list):
+        if len(inputs) != 2:
+            raise ValueError(f"JoinOp expects exactly 2 inputs (left and right dataframes), got {len(inputs)}.")
+        left_df = inputs[0]
+        right_df = inputs[1]
+
+        if FLAGS.force_polars:
+            raise NotImplementedError("JoinOp Polars backend is not implemented yet.")
+        else:
+            return left_df.merge(
+                right_df,
+                left_on=self.left_on,
+                right_on=self.right_on,
+                how=self.how,
+                suffixes=self.suffixes,
+                left_index=self.left_index,
+                right_index=self.right_index
+            )
 
 class MetadataOp(Op):
     fields = ["func", "args", "kwargs"]
@@ -246,6 +289,7 @@ class GetAttrProjectionOp(Op):
             for attr in self.attr_name:
                 tmp = getattr(tmp, attr)
             return tmp
+
 class GroupedDataframeOp(Op):
     def __init__(self, ops: list[Op]):
         super().__init__(name="GROUPED_DATAFRAME", is_X=False, is_y=False)
@@ -377,6 +421,8 @@ def extract_dataframe_op(op: Op, root: Op) -> tuple[Op, bool]:
             elif op.method_name in ["assign"]:
                 new_op = AssignOp(args=op.args, kwargs=op.kwargs, inputs=op.inputs, outputs=op.outputs)
                 op.replace_output_of_inputs(new_op)
+            elif op.method_name in ["join", "merge"]:
+                new_op = make_join_op(op)
 
         # GetAttr Fusing and conversion to GetAttrDataframeOp
         elif isinstance(op, GetAttrOp) and op.inputs[0].is_dataframe_op:
@@ -443,6 +489,109 @@ def make_read_op(op: CallOp, format: str = "csv") -> DataSourceOp:
         in_.replace_output(op, new_op)
     return new_op
 
+
+_MERGE_POSITIONAL = ["how", "on", "left_on", "right_on",
+                    "left_index", "right_index", "sort", "suffixes"]
+_JOIN_POSITIONAL = ["on", "how", "lsuffix", "rsuffix", "sort"]
+_JOIN_OP_FIELDS = {"how", "left_on", "right_on", "left_index", "right_index", "suffixes"}
+
+def make_join_op(op: MethodCallOp) -> JoinOp:
+    # First positional arg is the right/other df; it's already in op.inputs
+    pos_args = op.args[1:] if op.args else ()
+    pos_names = _MERGE_POSITIONAL if op.method_name == "merge" else _JOIN_POSITIONAL
+
+    params = dict(zip(pos_names, pos_args))
+    if op.kwargs:
+        params.update(op.kwargs)
+    params.pop("other", None)
+
+    other_arg = op.args[0] if op.args else None
+    if other_arg is None and op.kwargs:
+        other_arg = op.kwargs.get("other")
+
+    if isinstance(other_arg, (list, tuple)):
+        if len(other_arg) != len(set(id(x) for x in other_arg)):
+            raise ValueError(
+                "Duplicate right-hand frames in chained joins are not supported."
+            )
+
+    is_chained = (
+        op.method_name == "join"
+        and (isinstance(other_arg, (list, tuple)) or len(op.inputs) > 2)
+    )
+
+    if op.method_name == "join":
+        # pandas .join() defaults to how="left" and matches against right's index.
+        params.setdefault("how", "left")
+        if is_chained:
+            # Chained joins are always index-based on every link.
+            params["left_index"] = True
+            params["right_index"] = True
+            params.pop("on", None)
+            params.pop("left_on", None)
+            params.pop("right_on", None)
+        elif "on" in params:
+            params["left_on"] = params.pop("on")
+            params["left_index"] = False
+            params["right_index"] = True
+        else:
+            params["left_index"] = True
+            params["right_index"] = True
+        # join uses lsuffix/rsuffix instead of suffixes; both default to "" in pandas.
+        if "lsuffix" in params or "rsuffix" in params:
+            params["suffixes"] = (params.pop("lsuffix", ""), params.pop("rsuffix", ""))
+        params.setdefault("suffixes", ("", ""))
+    else:
+        # merge's `on` applies to both sides when left_on/right_on are unset.
+        if "on" in params and "left_on" not in params and "right_on" not in params:
+            shared = params.pop("on")
+            params["left_on"] = shared
+            params["right_on"] = shared
+        else:
+            params.pop("on", None)
+        params.setdefault("suffixes", ("_x", "_y"))
+
+    if params.pop("sort", False):
+        raise NotImplementedError(
+            "sort=True is not supported by JoinOp."
+        )
+
+    unsupported = [
+        k for k in params
+        if k not in _JOIN_OP_FIELDS and k not in ("right", "other")
+    ]
+    if unsupported:
+        raise NotImplementedError(
+            f"Unsupported arguments for {op.method_name}(): {', '.join(sorted(unsupported))}"
+        )
+
+    join_kwargs = {k: v for k, v in params.items() if k in _JOIN_OP_FIELDS}
+
+    if is_chained:
+        return _make_chained_join_op(op, join_kwargs)
+
+    new_op = JoinOp(**join_kwargs, inputs=op.inputs, outputs=op.outputs)
+    op.replace_output_of_inputs(new_op)
+    return new_op
+
+def _make_chained_join_op(op: MethodCallOp, join_kwargs: dict) -> JoinOp:
+    """Unroll df1.join([df2, df3, ...]) into a chain of binary JoinOps."""
+    dfs = op.inputs
+    prev = dfs[0]
+    final_join = None
+    n_links = len(dfs) - 1
+    for i, right in enumerate(dfs[1:]):
+        is_last = i == n_links - 1
+        join = JoinOp(**join_kwargs, inputs=[prev, right],
+                      outputs=op.outputs if is_last else [])
+        right.replace_output(op, join)
+        if final_join is not None:
+            final_join.outputs = [join]
+        else:
+            prev.replace_output(op, join)
+        prev = join
+        final_join = join
+    return final_join
 
 def make_frame_get_attr(new_op: GetAttrProjectionOp, op: GetAttrOp) -> GetAttrProjectionOp:
     input_ = op.inputs[0]
