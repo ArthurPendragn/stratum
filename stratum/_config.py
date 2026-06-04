@@ -38,6 +38,7 @@ class _Flags:
     stats_top_k: int = 20
     debug_graph: bool = False
     open_graph: bool = False
+    explain_linear_plan: bool = False
     cse: bool = True
     DEBUG: bool = False
     force_polars: bool = _env_bool("STRATUM_FORCE_POLARS", False)
@@ -54,6 +55,7 @@ def set_config(rust_backend: bool | None = None,
     scheduler: bool = False,
     debug_graph: bool = False,
     open_graph: bool = False,
+    explain_linear_plan: bool = False,
     DEBUG: bool | None = None,
     force_polars: bool = False,
     cse: bool = True,
@@ -87,6 +89,9 @@ def set_config(rust_backend: bool | None = None,
 
         open_graph: bool, default true
             Open the graph after optimization.
+
+        explain_linear_plan: bool, default false
+            Print a text-based linear execution plan after optimization.
 
         DEBUG: bool, default false
             Enable/disable debug mode.
@@ -126,6 +131,7 @@ def set_config(rust_backend: bool | None = None,
     FLAGS.cse = bool(cse)
     FLAGS.debug_graph = bool(debug_graph)
     FLAGS.open_graph = bool(open_graph)
+    FLAGS.explain_linear_plan = bool(explain_linear_plan)
 
     #FIXME: This should be the default. No need to set it. Remove.
     FLAGS.fast_dataops_convert = bool(fast_dataops_convert)
@@ -143,6 +149,7 @@ def get_config() -> dict:
         "stats_top_k": FLAGS.stats_top_k,
         "debug_graph": FLAGS.debug_graph,
         "open_graph": FLAGS.open_graph,
+        "explain_linear_plan": FLAGS.explain_linear_plan,
         "DEBUG" : FLAGS.DEBUG,
         "force_polars": FLAGS.force_polars,
         "cse": FLAGS.cse,

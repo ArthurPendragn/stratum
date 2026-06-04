@@ -162,7 +162,7 @@ def topological_iterator_dfs(queue, indegree) -> Iterator[Op]:
 
 def show_graph(root: Op, filename: str = 'plan'):
     """Show the runtime plan of the DataOp DAG."""
-    dot = Digraph(comment=filename, format='png')
+    dot = Digraph(comment=filename, format='png', graph_attr={'rankdir': 'BT'})
     for current_op in topological_iterator(root):
         current_op.update_name()
         name = str(current_op) if not isinstance(current_op, ChoiceOp) else current_op.name

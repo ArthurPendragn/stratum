@@ -7,6 +7,7 @@ from .ir._dataframe_ops import extract_dataframe_op, add_splitting_op
 from .ir._numeric_ops import extract_numeric_op
 from .ir._ops import ChoiceOp, ImplOp, Op, SearchEvalOp, as_op
 from ._op_utils import clone_sub_dag, find_choice_naive, replace_op_in_outputs, show_graph, topological_iterator
+from ._explain import explain_linear_plan
 from ._algebraic_rewrites import algebraic_rewrites, AlgebraicRewritesConfig
 from ._linearization import linearize_dag
 from ._input_removal_planning import compute_pinned_ops, plan_input_removals
@@ -70,6 +71,10 @@ def _debug_show_graph(root: Op, name: str):
     if FLAGS.debug_graph:
         show_graph(root, name)
 
+def _debug_explain_linear_plan(name: str, linearized_dag: list, split_pos: int | None):
+    if FLAGS.explain_linear_plan:
+        explain_linear_plan(name, linearized_dag, split_pos)
+
 def optimize(dag_root: DataOp, config: OptConfig = None):
     """ Entry point for the logical optimizer. Takes a Skrub DataOp DAG, applies logical optimizations,
     and returns an Op root node."""
@@ -113,6 +118,8 @@ def optimize(dag_root: DataOp, config: OptConfig = None):
     linearized_dag, split_pos, flagged_ops = linearize_dag(root)
     pinned_ops = compute_pinned_ops(linearized_dag, split_pos, flagged_ops)
     plan_input_removals(linearized_dag, pinned_ops)
+
+    _debug_explain_linear_plan("explain_linear_plan", linearized_dag, split_pos)
 
     log_time("Optimization took in total", start)
     return linearized_dag, split_pos, flagged_ops
