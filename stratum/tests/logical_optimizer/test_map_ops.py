@@ -12,8 +12,9 @@ from stratum.optimizer.ir._map_ops import AssignMapOp
 from stratum.optimizer.ir._projection_ops import (
     AssignOp, DatetimeConversionOp, GetAttrProjectionOp)
 from stratum.optimizer.ir._column_expr import (
-    BinOpExpr, Col, Const, DatetimeExpr, DtExpr, OperandLeaf, StrExpr)
-from stratum.optimizer.ir._ops import BinOp, GetItemOp, Op, OperandRef
+    BinOpExpr, Col, Const, DatetimeExpr, DtExpr, OperandLeaf, StrExpr, _Folder)
+from stratum.optimizer.ir._ops import (
+    BinOp, GetItemOp, Op, OperandRef, UnaryOp)
 from stratum.tests.logical_optimizer.test_dataframe_ops import (
     optimize, run_op, force_polars, make_map_op)
 
@@ -55,6 +56,22 @@ class TestAssignMapFolding(unittest.TestCase):
         out = src.assign(c4=date_col.dt.day, c5=date_col.dt.day)
         map_op = _one(self, optimize(out, OptConfig(dataframe_ops=True)), AssignMapOp)
         self.assertIs(map_op.entries["c4"].operand, map_op.entries["c5"].operand)
+
+    def test_same_root_reused_across_entries(self):
+        src = st.as_data_op(self.df)
+        derived = src["c1"] + 1
+        out = src.assign(first=derived, second=derived)
+        map_op = _one(self, optimize(out, OptConfig(dataframe_ops=True)), AssignMapOp)
+        self.assertIs(map_op.entries["first"], map_op.entries["second"])
+
+    def test_same_producer_used_for_both_operands(self):
+        src = st.as_data_op(self.df)
+        derived = src["c1"] + 1
+        out = src.assign(total=derived + derived)
+        map_op = _one(self, optimize(out, OptConfig(dataframe_ops=True)), AssignMapOp)
+        total = map_op.entries["total"]
+        self.assertIsInstance(total, BinOpExpr)
+        self.assertIs(total.left, total.right)
 
     def test_str_method_folds_to_str_expr(self):
         src = st.as_data_op(self.df)
@@ -151,6 +168,14 @@ class TestAssignMapProcess(unittest.TestCase):
         self.assertEqual([11, 12, 13], result["y"].to_list())
         self.assertEqual([1, 3, 5], result["day"].to_list())
 
+    def test_is_month_end_entry_polars(self):
+        frame = pl.DataFrame({
+            "d": pl.Series("d", pd.to_datetime(["2025-01-31", "2025-01-15"]))})
+        op = AssignMapOp(entries={"end": DtExpr(Col("d"), "is_month_end")})
+        with force_polars():
+            result = run_op(op, frame)
+        self.assertEqual([True, False], result["end"].to_list())
+
     def test_operand_leaf_entry(self):
         op = AssignMapOp(entries={"ext": OperandLeaf(OperandRef(1))})
         result = run_op(op, self.df, pd.Series([7, 8, 9]))
@@ -227,6 +252,54 @@ class TestMapExprRefContract(unittest.TestCase):
         expr = DtExpr(DatetimeExpr(Col("d")), "month")
         self.assertEqual([], list(expr.iter_operand_refs()))
         self.assertEqual(expr, expr.remap_operand_refs({}))
+
+
+class TestFolderEdgeCases(unittest.TestCase):
+    def test_constant_unary_has_no_producer(self):
+        folder = _Folder(Op())
+        unary = UnaryOp(operator.neg, 1)
+        self.assertEqual([], folder._producer_ops(unary))
+
+    def test_source_root_becomes_input_zero_leaf(self):
+        source = Op()
+        consumer = Op(inputs=[source])
+        source.outputs = [consumer]
+        folder = _Folder(source)
+
+        expr = folder.fold(source, root_consumer=consumer)
+
+        self.assertEqual(OperandLeaf(OperandRef(0)), expr)
+        self.assertEqual([], folder.leaf_ops)
+
+    def test_absorb_is_idempotent(self):
+        folder = _Folder(Op())
+        node = Op()
+        folder._absorb(node)
+        folder._absorb(node)
+        self.assertEqual([node], folder.absorbed)
+
+    def test_shared_child_of_dropped_roots_is_dropped_once(self):
+        source = Op()
+        shared = UnaryOp(operator.neg, OperandRef(0))
+        shared.inputs = [source]
+        first = UnaryOp(operator.neg, OperandRef(0))
+        first.inputs = [shared]
+        second = UnaryOp(operator.pos, OperandRef(0))
+        second.inputs = [shared]
+        consumer = Op(inputs=[source, first, second])
+        first_external = Op(inputs=[first])
+        second_external = Op(inputs=[second])
+        source.outputs = [shared, consumer]
+        shared.outputs = [first, second]
+        first.outputs = [consumer, first_external]
+        second.outputs = [consumer, second_external]
+        folder = _Folder(source)
+        subgraph, children = folder._discover([first, second])
+
+        absorbable = folder._absorbable(
+            [first, second], consumer, subgraph, children)
+
+        self.assertEqual(set(), absorbable)
 
 
 """End-to-end: folded maps run through the full optimize + execute path."""

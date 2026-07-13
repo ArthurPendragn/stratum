@@ -5,6 +5,7 @@ from stratum.optimizer._optimize import  optimize
 from stratum.optimizer._optimize import OptConfig
 from stratum.optimizer._algebraic_rewrites import AlgebraicRewritesConfig
 from stratum.optimizer.ir._numeric_ops import NumericOp, NumericOpType
+from stratum.optimizer.ir._ops import OperandRef
 
 class TestCSE(unittest.TestCase):
 
@@ -264,6 +265,22 @@ class TestCSE(unittest.TestCase):
         out, *_ = optimize(root)
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0].process("fit", [out[0].value]), 2)
+
+    def test_eliminate_identity_operation_dedups_repeated_input(self):
+        value = st.as_data_op(2)
+        a = value + (value * 1)
+        b = (value * 1) + value
+        root = a + b
+
+        out, *_ = optimize(root)
+
+        self.assertEqual(len(out), 4)
+        self.assertEqual(out[1].inputs, [out[0]])
+        self.assertEqual(out[2].inputs, [out[0]])
+        self.assertEqual(out[2].opt_operand, OperandRef(0))
+        left_sum = out[1].process("fit", [out[0].value])
+        right_sum = out[2].process("fit", [out[0].value])
+        self.assertEqual(out[3].process("fit", [left_sum, right_sum]), 8)
 
     def test_abs_abs_collapses_to_single_abs(self):
         df = st.as_data_op(-3)

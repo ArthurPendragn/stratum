@@ -9,11 +9,13 @@ from skrub import selectors
 from stratum.optimizer.ir._projection_ops import (
     ApplyUDFOp, AssignOp, ColumnSelectorOp, DatetimeConversionOp, DropOp,
     GetAttrProjectionOp, MetadataOp, ProjectionOp, StringMethodOp,
-    make_datetime_conversion_op)
+    make_datetime_conversion_op, make_frame_get_attr, make_string_method_op,
+    polars_datetime_kwargs)
 from stratum.optimizer.ir._map_ops import AssignMapOp
 from stratum.optimizer.ir._column_expr import Col, DtExpr
-from stratum.optimizer.ir._ops import (CallOp, GetItemOp, MethodCallOp, OperandRef,
-                                       OutputType, TransformerOp)
+from stratum.optimizer.ir._ops import (
+    CallOp, GetAttrOp, GetItemOp, MethodCallOp, Op, OperandRef, OutputType,
+    TransformerOp)
 from stratum.tests.logical_optimizer.test_dataframe_ops import (
     PolarsTestCase, _inp, _inputs_for, force_polars, make_map_op, optimize, run_op)
 
@@ -89,6 +91,10 @@ class TestProjectionOp(unittest.TestCase):
     def test_func_and_method_are_mutually_exclusive(self):
         with self.assertRaises(ValueError):
             ProjectionOp(func=lambda x: x, method="drop", args=(), kwargs={})
+
+    def test_kwargs_can_be_omitted(self):
+        op = ProjectionOp(method="copy", args=(), kwargs=None)
+        self.assertIsNone(op.kwargs)
 
     def test_no_func_no_method_raises(self):
         with self.assertRaises(TypeError):
@@ -199,6 +205,30 @@ class TestDatetimeConversionOp(unittest.TestCase):
             result = run_op(op, pl.Series("dt", ["01/02/2020"]))
         self.assertEqual([pd.Timestamp("2020-02-01")], result.to_list())
 
+    def test_polars_positional_options_use_pandas_semantics(self):
+        with force_polars():
+            op = DatetimeConversionOp(args=("coerce",), kwargs={})
+            result = run_op(op, pl.Series("dt", ["2025-01-01", "bad"]))
+        self.assertEqual([pd.Timestamp("2025-01-01"), None], result.to_list())
+
+    def test_polars_fallback_converts_datetime_index(self):
+        with force_polars():
+            op = DatetimeConversionOp(args=(), kwargs={"dayfirst": True})
+            result = run_op(op, ["01/02/2020", "03/04/2021"])
+        self.assertEqual(
+            [pd.Timestamp("2020-02-01"), pd.Timestamp("2021-04-03")],
+            result.to_list())
+
+    def test_polars_fallback_keeps_scalar_result(self):
+        with force_polars():
+            op = DatetimeConversionOp(args=(), kwargs={"dayfirst": True})
+            result = run_op(op, "01/02/2020")
+        self.assertEqual(pd.Timestamp("2020-02-01"), result)
+
+    def test_polars_datetime_kwargs_rejects_unsupported_errors(self):
+        self.assertIsNone(
+            polars_datetime_kwargs((), {"errors": "ignore"}))
+
 
 class TestGetAttrProjectionOp(unittest.TestCase):
     def test_init_with_none(self):
@@ -226,6 +256,27 @@ class TestGetAttrProjectionOp(unittest.TestCase):
         result = self._run_polars(["2025-01-31", "2025-01-15"],
                                   ["dt", "is_month_end"])
         self.assertEqual([True, False], result.to_list())
+
+    def test_polars_single_accessor_returns_namespace(self):
+        result = self._run_polars(["2025-01-15"], ["dt"])
+        self.assertEqual([2025], result.year().to_list())
+
+    def test_shared_accessor_keeps_original_edge_when_fused(self):
+        source = Op()
+        source.output_type = OutputType.SERIES
+        accessor = GetAttrProjectionOp(
+            attr_name=["dt"], inputs=[source], outputs=[])
+        current = GetAttrOp(attr_name="year")
+        current.inputs = [accessor]
+        other_consumer = Op(inputs=[accessor])
+        accessor.outputs = [current, other_consumer]
+        source.outputs = [accessor]
+
+        new_op = make_frame_get_attr(None, current)
+
+        self.assertEqual([other_consumer], accessor.outputs)
+        self.assertIn(accessor, source.outputs)
+        self.assertIn(new_op, source.outputs)
 
 
 class TestStringMethodOp(unittest.TestCase):
@@ -276,6 +327,24 @@ class TestStringMethodOp(unittest.TestCase):
             op = StringMethodOp(method="count", args=("1",))
             result = run_op(op, pl.Series(["a1", "bb", "c1"]))
         self.assertEqual([1, 0, 1], result.to_list())
+
+    def test_graph_argument_is_rewired_to_fused_method(self):
+        column = Op()
+        column.output_type = OutputType.SERIES
+        accessor = GetAttrProjectionOp(
+            attr_name=["str"], inputs=[column], outputs=[])
+        argument = Op()
+        call = MethodCallOp(
+            method_name="contains", args=(OperandRef(1),), kwargs={})
+        call.inputs = [accessor, argument]
+        accessor.outputs = [call]
+        argument.outputs = [call]
+        column.outputs = [accessor]
+
+        new_op = make_string_method_op(call)
+
+        self.assertIn(new_op, argument.outputs)
+        self.assertNotIn(call, argument.outputs)
 
 
 class TestColumnSelectorExtraction(unittest.TestCase):
