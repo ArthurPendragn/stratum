@@ -10,10 +10,12 @@ from stratum.optimizer.ir._projection_ops import (
     ApplyUDFOp, AssignOp, ColumnSelectorOp, DatetimeConversionOp, DropOp,
     GetAttrProjectionOp, MetadataOp, ProjectionOp, StringMethodOp,
     make_datetime_conversion_op)
+from stratum.optimizer.ir._map_ops import AssignMapOp
+from stratum.optimizer.ir._column_expr import Col, DtExpr
 from stratum.optimizer.ir._ops import (CallOp, GetItemOp, MethodCallOp, OperandRef,
                                        OutputType, TransformerOp)
 from stratum.tests.logical_optimizer.test_dataframe_ops import (
-    PolarsTestCase, _inp, _inputs_for, force_polars, optimize, run_op)
+    PolarsTestCase, _inp, _inputs_for, force_polars, make_map_op, optimize, run_op)
 
 
 class TestProjectionRewrites(unittest.TestCase):
@@ -57,13 +59,13 @@ class TestProjectionRewrites(unittest.TestCase):
                            month=data["datetime"].dt.month)
         data = data.copy()
         ops = optimize(data)
-        self.assertEqual(8, len(ops))
-        op_iter = iter(ops[3:])
-        next(op_iter)
-        self.assertIsInstance(next(op_iter), GetAttrProjectionOp)
-        self.assertIsInstance(next(op_iter), GetAttrProjectionOp)
-        self.assertIsInstance(next(op_iter), AssignOp)
-        self.assertIsInstance(next(op_iter), MethodCallOp)
+        # The column getitem and both fused .dt accessors fold into the assign map.
+        self.assertEqual(5, len(ops))
+        map_op = next(o for o in ops if isinstance(o, AssignMapOp))
+        self.assertEqual({"year": DtExpr(Col("datetime"), "year"),
+                          "month": DtExpr(Col("datetime"), "month")},
+                         map_op.entries)
+        self.assertIsInstance(ops[-1], MethodCallOp)  # the trailing .copy()
 
 
 class TestMetadataOp(unittest.TestCase):
@@ -186,6 +188,17 @@ class TestDatetimeConversionOp(unittest.TestCase):
             result = run_op(op, pl.Series("dt", ["2025-01-01", "2025-06-15"]))
             self.assertEqual(pl.Datetime, result.dtype)
 
+    def test_pandas_path_preserves_kwargs(self):
+        op = DatetimeConversionOp(args=(), kwargs={"dayfirst": True})
+        result = run_op(op, pd.Series(["01/02/2020"]))
+        self.assertEqual(pd.Timestamp("2020-02-01"), result.iloc[0])
+
+    def test_polars_unsupported_kwargs_use_pandas_semantics(self):
+        with force_polars():
+            op = DatetimeConversionOp(args=(), kwargs={"dayfirst": True})
+            result = run_op(op, pl.Series("dt", ["01/02/2020"]))
+        self.assertEqual([pd.Timestamp("2020-02-01")], result.to_list())
+
 
 class TestGetAttrProjectionOp(unittest.TestCase):
     def test_init_with_none(self):
@@ -229,9 +242,12 @@ class TestStringMethodOp(unittest.TestCase):
     def test_str_method_fuses_accessor_away(self):
         # A str call used as a column projection (here assigned) becomes a single
         # StringMethodOp; the GetAttrProjectionOp(["str"]) accessor drops out.
+        # Map folding is disabled so the intermediate op stays observable (with it
+        # on, the assign absorbs the call into a StrExpr entry -- see test_map_ops).
         data = st.as_data_op(self.df)
-        ops = optimize(data.assign(c=data["s"].str.upper()),
-                       OptConfig(dataframe_ops=True))
+        with make_map_op(False):
+            ops = optimize(data.assign(c=data["s"].str.upper()),
+                           OptConfig(dataframe_ops=True))
         sm = self._one(ops, StringMethodOp)
         self.assertEqual("upper", sm.method)
         self.assertIs(OutputType.SERIES, sm.output_type)
@@ -243,8 +259,9 @@ class TestStringMethodOp(unittest.TestCase):
         # StringMethodOp and the accessor is removed once its last consumer is fused.
         data = st.as_data_op(self.df)
         acc = data["s"].str
-        ops = optimize(data.assign(a=acc.count("1"), b=acc.upper()),
-                       OptConfig(dataframe_ops=True))
+        with make_map_op(False):
+            ops = optimize(data.assign(a=acc.count("1"), b=acc.upper()),
+                           OptConfig(dataframe_ops=True))
         self.assertEqual(2, len([o for o in ops if isinstance(o, StringMethodOp)]))
         self.assertEqual([], [o for o in ops if isinstance(o, GetAttrProjectionOp)])
 
