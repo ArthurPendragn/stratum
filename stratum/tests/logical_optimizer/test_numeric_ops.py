@@ -5,7 +5,7 @@ import stratum as st
 import numpy as np
 from sklearn.dummy import DummyRegressor
 from stratum.optimizer.ir._numeric_ops import NumericOp, NumericOpType, make_binary_numeric_op
-from stratum.optimizer.ir._ops import CallOp, OperandRef
+from stratum.optimizer.ir._ops import CallOp, OperandRef, ValueOp
 from stratum.optimizer._optimize import optimize
 
 class TestNumericOps(unittest.TestCase):
@@ -321,3 +321,19 @@ class TestNumericOps(unittest.TestCase):
         self.assertTrue(result.reversed)
         self.assertIsNone(result.opt_operand)
         self.assertEqual(result.process("fit", [3]), 7)
+
+    def test_eliminate_x_mul_zero(self):
+        df = st.as_data_op(7)
+        out, *_ = optimize(df * 0)
+        # the multiply is folded away entirely
+        self.assertFalse(any(isinstance(o, NumericOp) and o.type == NumericOpType.MULTIPLY for o in out))
+        # and replaced by a constant-zero source node that needs no inputs
+        zero = next(o for o in out if isinstance(o, ValueOp))
+        self.assertEqual(zero.process("fit", []), 0.0)
+
+    def test_eliminate_zero_mul_x(self):
+        df = st.as_data_op(7)
+        out, *_ = optimize(0 * df)
+        self.assertFalse(any(isinstance(o, NumericOp) and o.type == NumericOpType.MULTIPLY for o in out))
+        zero = next(o for o in out if isinstance(o, ValueOp))
+        self.assertEqual(zero.process("fit", []), 0.0)

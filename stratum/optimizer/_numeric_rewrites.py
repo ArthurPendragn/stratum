@@ -1,6 +1,6 @@
 from stratum.optimizer.ir._numeric_ops import NumericOp, NumericOpType
 from stratum.optimizer._op_utils import rewrite_pass, replace_op_in_outputs
-from stratum.optimizer.ir._ops import Op
+from stratum.optimizer.ir._ops import Op, ValueOp
 
 
 def match_two_op_chain(op_cls, type1, type2):
@@ -97,6 +97,20 @@ def match_exp_minus_one(op):
             return (op, op2)
     return None
 
+def fold_to_zero(op: Op, root: Op) -> Op:
+    """Constant-fold ``x * 0`` (or ``0 * x``) to ``0``.
+
+    Unlike the identity rewrites, the result is not the input but a constant, so
+    we drop the multiply and its now-dead operand edges and rewire downstream
+    consumers to a :class:`ValueOp` holding ``0.0``. A ValueOp is a source node
+    (no inputs) whose ``process`` returns the constant directly, so the whole
+    ``x`` subgraph is never computed.
+    """
+    zero_op = ValueOp(0.0)
+    for operand in op.inputs:
+        operand.outputs = [out for out in operand.outputs if out is not op]
+    replace_op_in_outputs(op, zero_op)
+    return zero_op if op is root else root
 
 
 eliminate_log_exp = rewrite_pass(
@@ -152,4 +166,10 @@ eliminate_exp_minus_one = rewrite_pass(match_exp_minus_one, _replace_with_expm1)
 eliminate_identity_subtract = rewrite_pass(
     match_identity_operation(NumericOp, NumericOpType.SUBTRACT, 0, reversed=False),
     eliminate_single_op_chain_root_safe,
+)
+
+
+eliminate_any_mul_zero = rewrite_pass(
+    match_identity_operation(NumericOp, NumericOpType.MULTIPLY, 0),
+    fold_to_zero,
 )
