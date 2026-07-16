@@ -509,3 +509,78 @@ class TestCSE(unittest.TestCase):
         out, *_ = optimize(t2)
         # x - 0 would collapse to 2 ops; 0 - x stays as 3 ops
         self.assertEqual(len(out), 3)
+
+    def test_eliminate_div_by_one_fires(self):
+        df = st.as_data_op(6)
+        t1 = df / 1
+
+        out, *_ = optimize(t1)
+        self.assertEqual(len(out), 1)                        # only the ValueOp remains
+        self.assertEqual(out[0].value, 6)
+
+    def test_eliminate_div_by_one_in_chain(self):
+        df = st.as_data_op(6)
+        t1 = df / 1
+        t2 = t1 + 3
+
+        out, *_ = optimize(t2)
+        self.assertEqual(len(out), 2)                        # ValueOp + ADD
+        self.assertEqual(out[1].process("fit", [out[0].value]), 9)
+
+    def test_eliminate_div_by_one_disabled(self):
+        df = st.as_data_op(6)
+        t1 = df / 1
+        config = OptConfig(
+            algebraic_rewrites=True,
+            algebraic_rewrite_config=AlgebraicRewritesConfig(div_by_one=False),
+        )
+        out, *_ = optimize(t1, config=config)
+        self.assertEqual(len(out), 2)                        # DIV remains
+
+    def test_no_rewrite_one_over_x(self):
+        """1 / x must NOT be rewritten — DIVIDE is non-commutative."""
+        df = st.as_data_op(6)
+        t1 = 1 / df
+
+        out, *_ = optimize(t1)
+        self.assertEqual(len(out), 2)                        # ValueOp + DIV(reversed=True)
+        # sanity: check the DIV is still there and reversed
+        div_op = out[1]
+        self.assertIsInstance(div_op, NumericOp)
+        self.assertEqual(div_op.type, NumericOpType.DIVIDE)
+        self.assertTrue(div_op.reversed)
+
+    def test_no_rewrite_div_by_other_constant(self):
+        """x / 2 must NOT be rewritten — only constant 1 counts."""
+        df = st.as_data_op(6)
+        t1 = df / 2
+
+        out, *_ = optimize(t1)
+        self.assertEqual(len(out), 2)
+
+    def test_no_crash_div_by_ndarray_constant(self):
+        """df / ndarray must neither crash nor rewrite (ambiguous-truth-value trap)."""
+        df = st.as_data_op(np.array([6.0, 8.0]))
+        t1 = df / np.array([1.0, 1.0])
+
+        out, *_ = optimize(t1)
+        self.assertEqual(len(out), 2)                        # ValueOp + DIV survive
+
+    def test_no_crash_mul_by_ndarray_constant(self):
+        """Regression for the pre-existing crash in mul-by-one (#93): before the
+        isinstance guard, `df * np.array([...])` raised 'truth value of an array
+        is ambiguous' inside match_identity_operation."""
+        df = st.as_data_op(np.array([6.0, 8.0]))
+        t1 = df * np.array([2.0, 3.0])
+
+        out, *_ = optimize(t1)
+        self.assertEqual(len(out), 2)                        # ValueOp + MUL survive
+
+    def test_no_crash_exp_minus_ndarray_constant(self):
+        """`exp(x) - ndarray` must not hit the ambiguous-truth-value trap inside
+        match_exp_minus_one (same crash class as the mul/div guards)."""
+        df = st.as_data_op(np.array([1.0, 2.0]))
+        t1 = df.skb.apply_func(np.exp) - np.array([1.0, 1.0])
+
+        out, *_ = optimize(t1)
+        self.assertEqual(len(out), 3)                        # ValueOp + EXP + SUBTRACT survive

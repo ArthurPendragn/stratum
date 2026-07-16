@@ -3,6 +3,16 @@ from stratum.optimizer._op_utils import rewrite_pass, replace_op_in_outputs
 from stratum.optimizer.ir._ops import Op, ValueOp
 
 
+def _is_scalar_const(value) -> bool:
+    """True if ``value`` is a scalar numeric constant safe to compare with ``==``.
+
+    Guards against ndarray constants (e.g. ``df * np.array([...])``), whose
+    ``== const`` yields an array and raises "truth value of an array is
+    ambiguous" when used in a boolean context.
+    """
+    return isinstance(value, (int, float))
+
+
 def match_two_op_chain(op_cls, type1, type2):
     """Match predicate for two consecutive ops of the same class with given types."""
     def match(op):
@@ -26,7 +36,8 @@ def match_identity_operation(op_cls, type1, const, reversed=None):
     """
     def match(op1):
         if isinstance(op1, op_cls) and op1.type == type1:
-            if op1.opt_operand is None and op1.constant == const:
+            if op1.opt_operand is None and _is_scalar_const(op1.constant) \
+                    and op1.constant == const:
                 if reversed is None or op1.reversed == reversed:
                     return (op1,)
         return None
@@ -93,7 +104,8 @@ def match_exp_minus_one(op):
     if isinstance(op, NumericOp) and op.type is NumericOpType.EXP and len(op.outputs) == 1:
         op2 = op.outputs[0]
         if (isinstance(op2, NumericOp) and op2.type is NumericOpType.SUBTRACT
-                and op2.opt_operand is None and op2.constant == 1 and not op2.reversed):
+                and op2.opt_operand is None and _is_scalar_const(op2.constant)
+                and op2.constant == 1 and not op2.reversed):
             return (op, op2)
     return None
 
@@ -172,4 +184,15 @@ eliminate_identity_subtract = rewrite_pass(
 eliminate_any_mul_zero = rewrite_pass(
     match_identity_operation(NumericOp, NumericOpType.MULTIPLY, 0),
     fold_to_zero,
+)
+
+# TODO(dtype): unlike the other identity rewrites (`x*1`, `x+0`, `x-0`), dropping
+# `x / 1` is not dtype-preserving. `np.divide` always performs true division, so
+# `int_array / 1` yields float64 while the eliminated result keeps the original
+# integer dtype. The values are equal but the dtype changes. This is fine for the
+# current ML/feature-engineering use cases; revisit if a dtype-preservation
+# contract is ever required (e.g. skip the rewrite for integer inputs).
+eliminate_div_by_one = rewrite_pass(
+    match_identity_operation(NumericOp, NumericOpType.DIVIDE, 1, reversed=False),
+    eliminate_single_op_chain_root_safe,
 )
