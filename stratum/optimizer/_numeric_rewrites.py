@@ -13,13 +13,32 @@ def _is_scalar_const(value) -> bool:
     return isinstance(value, (int, float))
 
 
-def match_two_op_chain(op_cls, type1, type2):
-    """Match predicate for two consecutive ops of the same class with given types."""
-    def match(op):
-        if isinstance(op, op_cls) and op.type is type1 and len(op.outputs) == 1:
-            op2 = op.outputs[0]
-            if isinstance(op2, op_cls) and op2.type is type2:
-                return (op, op2)
+def _matches_scalar_const(op, const, reversed=None):
+    """Return whether ``op`` has the requested scalar constant operand."""
+    return (
+        op.opt_operand is None
+        and _is_scalar_const(op.constant)
+        and op.constant == const
+        and (reversed is None or op.reversed == reversed)
+    )
+
+
+def match_two_op_chain(op_cls, type1, type2, *, match1=None, match2=None):
+    """Match a typed two-op chain with optional per-operation predicates."""
+    def match(op1):
+        if (
+            isinstance(op1, op_cls)
+            and op1.type is type1
+            and len(op1.outputs) == 1
+            and (match1 is None or match1(op1))
+        ):
+            op2 = op1.outputs[0]
+            if (
+                isinstance(op2, op_cls)
+                and op2.type is type2
+                and (match2 is None or match2(op2))
+            ):
+                return (op1, op2)
         return None
     return match
 
@@ -36,10 +55,8 @@ def match_identity_operation(op_cls, type1, const, reversed=None):
     """
     def match(op1):
         if isinstance(op1, op_cls) and op1.type == type1:
-            if op1.opt_operand is None and _is_scalar_const(op1.constant) \
-                    and op1.constant == const:
-                if reversed is None or op1.reversed == reversed:
-                    return (op1,)
+            if _matches_scalar_const(op1, const, reversed):
+                return (op1,)
         return None
     return match
 
@@ -98,18 +115,6 @@ def make_replace_two_op_chain_root_safe(make_replacement):
         return root
     return action
 
-
-def match_exp_minus_one(op):
-    """Match exp(x) - 1"""
-    if isinstance(op, NumericOp) and op.type is NumericOpType.EXP and len(op.outputs) == 1:
-        op2 = op.outputs[0]
-        if (isinstance(op2, NumericOp) and op2.type is NumericOpType.SUBTRACT
-                and op2.opt_operand is None and _is_scalar_const(op2.constant)
-                and op2.constant == 1 and not op2.reversed):
-            return (op, op2)
-    return None
-
-
 def fold_to_zero(op: Op, root: Op) -> Op:
     """Constant-fold ``x * 0`` (or ``0 * x``) to ``0``.
 
@@ -139,6 +144,26 @@ def fold_to_one(op: Op, root: Op) -> Op:
     return one_op if op is root else root
 
 
+match_exp_minus_one = match_two_op_chain(NumericOp, NumericOpType.EXP, NumericOpType.SUBTRACT,
+    match2=lambda op: _matches_scalar_const(op, 1, reversed=False),
+)
+
+match_add_one_then_log = match_two_op_chain(NumericOp, NumericOpType.ADD, NumericOpType.LOG,
+    match1=lambda op: _matches_scalar_const(op, 1),
+)
+
+_replace_with_abs = make_replace_two_op_chain_root_safe(
+    lambda: NumericOp(inputs=[], outputs=[], type=NumericOpType.ABS)
+)
+
+_replace_with_expm1 = make_replace_two_op_chain_root_safe(
+    lambda: NumericOp(inputs=[], outputs=[], type=NumericOpType.EXPM1)
+)
+
+_replace_with_log1p = make_replace_two_op_chain_root_safe(
+    lambda: NumericOp(inputs=[], outputs=[], type=NumericOpType.LOG1P)
+)
+
 eliminate_log_exp = rewrite_pass(
     match_two_op_chain(NumericOp, NumericOpType.LOG, NumericOpType.EXP),
     eliminate_two_op_chain_root_safe,
@@ -157,10 +182,6 @@ eliminate_expm1_log1p = rewrite_pass(
 eliminate_log1p_expm1 = rewrite_pass(
     match_two_op_chain(NumericOp, NumericOpType.LOG1P, NumericOpType.EXPM1),
     eliminate_two_op_chain_root_safe,
-)
-
-_replace_with_abs = make_replace_two_op_chain_root_safe(
-    lambda: NumericOp(inputs=[], outputs=[], type=NumericOpType.ABS)
 )
 
 eliminate_sqrt_square = rewrite_pass(
@@ -183,11 +204,7 @@ eliminate_add_zero = rewrite_pass(
     eliminate_single_op_chain_root_safe,
 )
 
-_replace_with_expm1 = make_replace_two_op_chain_root_safe(
-    lambda: NumericOp(inputs=[], outputs=[], type=NumericOpType.EXPM1)
-)
-
-eliminate_exp_minus_one = rewrite_pass(match_exp_minus_one, _replace_with_expm1)
+fold_exp_minus_one = rewrite_pass(match_exp_minus_one, _replace_with_expm1)
 
 eliminate_identity_subtract = rewrite_pass(
     match_identity_operation(NumericOp, NumericOpType.SUBTRACT, 0, reversed=False),
@@ -208,10 +225,10 @@ eliminate_pow_zero = rewrite_pass(
 # TODO(dtype): unlike the other identity rewrites (`x*1`, `x+0`, `x-0`), dropping
 # `x / 1` is not dtype-preserving. `np.divide` always performs true division, so
 # `int_array / 1` yields float64 while the eliminated result keeps the original
-# integer dtype. The values are equal but the dtype changes. This is fine for the
-# current ML/feature-engineering use cases; revisit if a dtype-preservation
-# contract is ever required (e.g. skip the rewrite for integer inputs).
+# integer dtype. The values are equal but the dtype changes.
 eliminate_div_by_one = rewrite_pass(
     match_identity_operation(NumericOp, NumericOpType.DIVIDE, 1, reversed=False),
     eliminate_single_op_chain_root_safe,
 )
+
+fold_log_plus_one = rewrite_pass(match_add_one_then_log, _replace_with_log1p)
