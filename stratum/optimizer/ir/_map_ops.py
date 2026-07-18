@@ -12,21 +12,17 @@ named, series-valued entries, with input columns passing through.
 """
 from __future__ import annotations
 
-import logging
-
 import pandas as pd
 import polars as pl
 
-from stratum._config import FLAGS
 from stratum.optimizer.ir._column_expr import (ColumnExpr, Const, EvalContext,
                                                _Folder)
 from stratum.optimizer.ir._ops import (MethodCallOp, Op, OperandRef, OutputType)
 
-logger = logging.getLogger(__name__)
-
 
 class MapOp(Op):
     """Base for folded column-map operators."""
+    logical_family = "Map"
 
     def __init__(self, name: str, inputs: list[Op] = None, outputs: list[Op] = None):
         super().__init__(name=name, inputs=inputs, outputs=outputs)
@@ -46,30 +42,9 @@ class AssignMapOp(MapOp):
 
     def __init__(self, entries: dict[str, ColumnExpr],
                  inputs: list[Op] = None, outputs: list[Op] = None):
-        super().__init__(name=f"MAP(assign: {', '.join(entries)})",
+        super().__init__(name=f"assign: {', '.join(entries)}",
                          inputs=inputs, outputs=outputs)
         self.entries = entries
-
-    def process(self, mode: str, inputs: list):
-        ctx = self.make_context(mode, inputs)
-        if FLAGS.force_polars:
-            columns = {}
-            for name, expr in self.entries.items():
-                result = expr.to_polars(ctx)
-                if isinstance(result, (pd.Series, pd.DataFrame)):
-                    # An OperandLeaf can feed pandas data into a polars plan.
-                    logger.warning(f"Converting pandas object to polars object for column {name}")
-                    result = pl.from_pandas(result)
-                elif isinstance(result, list):
-                    # Polars treats a list passed through the keyword API as one
-                    # list-valued scalar; assign semantics require a column.
-                    result = pl.Series(result)
-                columns[name] = result
-            # The keyword API accepts expressions, series, arrays and scalars,
-            # broadcasting the latter just like pandas.DataFrame.assign.
-            return ctx.frame.with_columns(**columns)
-        values = {name: expr.to_pandas(ctx) for name, expr in self.entries.items()}
-        return ctx.frame.assign(**values)
 
 
 # --- Folding: assign subgraphs -> MapOp ---------------------------------------

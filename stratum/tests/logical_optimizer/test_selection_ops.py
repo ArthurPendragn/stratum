@@ -10,10 +10,11 @@ import stratum as st
 from stratum._config import FLAGS
 from stratum.optimizer.ir._ops import remap_operand_refs
 from stratum.optimizer._optimize import OptConfig
-from stratum.optimizer.ir._dataframe_ops import SelectionKind, SelectionOp
+from stratum.optimizer.ir._dataframe_ops import (
+    ColumnProjectionOp, SelectionKind, SelectionOp)
 from stratum.optimizer.ir._ops import BinOp, GetItemOp, UnaryOp, Op, OperandRef, OutputType
 from stratum.optimizer.ir._column_expr import Col, Const, BinOpExpr, UnaryOpExpr, OperandLeaf, StrExpr
-from stratum.optimizer.ir._source_ops import rechunk_pl_frame
+from stratum.optimizer.physical._source_execs import rechunk_pl_frame
 from stratum.tests.logical_optimizer.test_dataframe_ops import (
     optimize, run_op, force_polars)
 
@@ -296,7 +297,9 @@ class TestMaskFolding(unittest.TestCase):
                       BinOpExpr(operator.lt, OperandLeaf(OperandRef(1)), Const(4))),
             sel.predicate)
         self.assertEqual(2, len(sel.inputs))  # [src, shared column]
-        self.assertTrue(any(isinstance(o, GetItemOp) for o in ops))  # column kept
+        # The shared column df["x"] has an external consumer (the assign), so it
+        # survives as a standalone column op -- now a ColumnProjectionOp.
+        self.assertTrue(any(isinstance(o, ColumnProjectionOp) for o in ops))  # column kept
 
 
 class TestColumnExprOperandRefs(unittest.TestCase):
@@ -398,6 +401,43 @@ class TestPandasQuery(unittest.TestCase):
         with pandas_query():
             result = run_op(op, self.df, 1)
         self.assertEqual([2, 3], result["x"].tolist())
+
+
+class TestPandasQueryImplSelection(unittest.TestCase):
+    """The query-vs-index choice is a plan-time bind, not a runtime branch."""
+
+    def _bind(self, op):
+        from stratum.optimizer.physical._impl_selection import bind_op
+        from stratum.optimizer.physical._plan_context import PlanContext
+        op.inputs = [Op()]
+        return bind_op(op, PlanContext.from_flags())
+
+    def test_expressible_mask_binds_query_impl_under_flag(self):
+        from stratum.optimizer.physical._selection_execs import PandasQuerySelectionOp
+        op = SelectionOp(kind=SelectionKind.MASK,
+                         predicate=BinOpExpr(operator.gt, Col("x"), Const(1)))
+        with pandas_query():
+            self.assertIsInstance(self._bind(op), PandasQuerySelectionOp)
+
+    def test_expressible_mask_binds_index_impl_without_flag(self):
+        from stratum.optimizer.physical._selection_execs import PandasIndexSelectionOp
+        op = SelectionOp(kind=SelectionKind.MASK,
+                         predicate=BinOpExpr(operator.gt, Col("x"), Const(1)))
+        self.assertIsInstance(self._bind(op), PandasIndexSelectionOp)
+
+    def test_non_expressible_mask_binds_index_impl_even_under_flag(self):
+        from stratum.optimizer.physical._selection_execs import PandasIndexSelectionOp
+        op = SelectionOp(kind=SelectionKind.MASK,
+                         predicate=BinOpExpr(operator.gt, Col("x"),
+                                             OperandLeaf(OperandRef(1))))
+        with pandas_query():
+            self.assertIsInstance(self._bind(op), PandasIndexSelectionOp)
+
+    def test_method_kind_binds_index_impl_under_flag(self):
+        from stratum.optimizer.physical._selection_execs import PandasIndexSelectionOp
+        op = SelectionOp(kind=SelectionKind.HEAD, args=(2,))
+        with pandas_query():
+            self.assertIsInstance(self._bind(op), PandasIndexSelectionOp)
 
 
 class TestColumnExprQueryStrings(unittest.TestCase):

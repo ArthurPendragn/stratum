@@ -76,12 +76,42 @@ class TestExplainLinearPlan(unittest.TestCase):
 
         captured_output = io.StringIO()
         with redirect_stdout(captured_output):
-            with st.config(explain_linear_plan=True):
+            with st.config(explain=True):
                 optimize(X)
 
         output_str = captured_output.getvalue()
-        self.assertIn("=== Plan: explain_linear_plan ===", output_str)
+        self.assertIn("=== Plan: physical_impl ===", output_str)
         print(output_str)
+
+    def test_explain_multiple_levels(self):
+        df = pd.DataFrame({"x": [1, 2, 3], "y": [4, 5, 6]})
+        data = st.var("data", df)
+        X = data[["x"]].skb.mark_as_X()
+
+        captured_output = io.StringIO()
+        with redirect_stdout(captured_output):
+            with st.config(explain=["logical", "physical", "physical_impl"]):
+                optimize(X)
+
+        output_str = captured_output.getvalue()
+        self.assertIn("=== Plan: logical ===", output_str)
+        self.assertIn("=== Plan: physical ===", output_str)
+        self.assertIn("=== Plan: physical_impl ===", output_str)
+
+    def test_explain_default_off(self):
+        df = pd.DataFrame({"x": [1, 2, 3]})
+        X = st.var("data", df)[["x"]].skb.mark_as_X()
+
+        captured_output = io.StringIO()
+        with redirect_stdout(captured_output):
+            optimize(X)
+
+        self.assertNotIn("=== Plan:", captured_output.getvalue())
+
+    def test_explain_invalid_level_raises(self):
+        with self.assertRaises(ValueError):
+            with st.config(explain=["nonsense"]):
+                pass
 
 
 if __name__ == "__main__":

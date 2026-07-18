@@ -114,7 +114,7 @@ class TestOpCSE(unittest.TestCase):
         # Two estimators differ in random_state -> both must remain.
         estimators = [
             op for op in topological_iterator(root)
-            if op.__class__.__name__ in ("EstimatorOp", "TransformerOp")
+            if op.__class__.__name__ in ("PredictorOp", "TransformerOp")
         ]
         self.assertEqual(len(estimators), 2)
 

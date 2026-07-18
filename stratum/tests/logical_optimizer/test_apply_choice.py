@@ -6,7 +6,7 @@ from skrub._utils import PassThrough
 from stratum._api import evaluate
 from stratum.optimizer._op_utils import topological_iterator
 from stratum.optimizer._optimize import choice_unrolling, convert_to_ops
-from stratum.optimizer.ir._ops import ChoiceOp, EstimatorOp, TransformerOp
+from stratum.optimizer.ir._ops import ChoiceOp, PredictorOp, TransformerOp
 import numpy as np
 import pandas as pd
 import stratum as st
@@ -52,7 +52,7 @@ class TestApplyChoice(unittest.TestCase):
         self.assertIsInstance(root, ChoiceOp)
         self.assertEqual(len(root.inputs), 2)
         for est_op in root.inputs:
-            self.assertIsInstance(est_op, EstimatorOp)
+            self.assertIsInstance(est_op, PredictorOp)
             self.assertEqual(len(est_op.inputs), 2)  # X and the graph-fed y
         # X and y ops are shared across the outcomes.
         self.assertIs(root.inputs[0].inputs[0], root.inputs[1].inputs[0])
@@ -115,13 +115,13 @@ class TestApplyChoice(unittest.TestCase):
         pred = scaled.skb.apply(Ridge(), y=y)
 
         root = convert_to_ops(pred)
-        self.assertIsInstance(root, EstimatorOp)
+        self.assertIsInstance(root, PredictorOp)
         root = choice_unrolling(root)
 
         self.assertIsInstance(root, ChoiceOp)
         self.assertEqual(root.make_outcome_names(),
                          ["scaler:StandardScaler", "scaler:MinMaxScaler"])
-        ridge_ops = [op for op in topological_iterator(root) if isinstance(op, EstimatorOp)]
+        ridge_ops = [op for op in topological_iterator(root) if isinstance(op, PredictorOp)]
         self.assertEqual(len(ridge_ops), 2)
         self.assertIsNot(ridge_ops[0].estimator, ridge_ops[1].estimator)
         self.assertEqual(sum(op.was_cloned for op in ridge_ops), 1)

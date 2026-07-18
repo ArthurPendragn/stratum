@@ -1,20 +1,17 @@
-from stratum.optimizer.ir._ops import (OperandRef, Op, ValueOp, VariableOp, CallOp,
-                                       _resolve_args, _resolve_kwargs)
-from stratum.optimizer.ir._ops import OutputType
+from stratum.optimizer.ir._ops import OperandRef, Op, OutputType, ValueOp, VariableOp, CallOp
 from pandas import DataFrame
-import pandas as pd
-import polars as pl
-import numpy as np
-from stratum._config import FLAGS
 
-def rechunk_pl_frame(df, rows_per_chunk = 128_000):
-    n = len(df)
-    if rows_per_chunk <= 0 or n <= rows_per_chunk:
-        return df
-    parts = [df.slice(i, rows_per_chunk) for i in range(0, n, rows_per_chunk)]
-    return pl.concat(parts, rechunk=False)
 
 class DataSourceOp(Op):
+    """Logical data source: an already-materialised frame or a file read.
+
+    Pure plan-time data -- it carries what to read (or the frame itself) but has
+    no ``process``: lowering always rewrites it into a physical source op
+    (``ReadCSV``/``ReadParquet``/``InMemoryFrame``/``NumpyLoad`` in
+    ``physical/_source_execs.py``), whose selected backend impl does the work.
+    """
+    logical_family = "Source"
+
     def __init__(self, data: DataFrame = None, file_path: str = None, _format: str = None,
                  read_args: tuple | list = None, read_kwargs: dict = None, is_X=False, is_y=False, outputs: list[Op] = None, inputs: list[Op] = None):
         if outputs is None:
@@ -30,31 +27,6 @@ class DataSourceOp(Op):
         # A directly-passed DataFrame or a csv read is a FRAME; np.load yields an
         # ndarray, so an npy source is a MATRIX.
         self.output_type = OutputType.MATRIX if _format == "npy" else OutputType.FRAME
-
-    def process(self, mode: str, inputs: list):
-        if self.data is not None:
-            if FLAGS.force_polars:
-                out = pl.DataFrame(self.data)
-                return rechunk_pl_frame(out) if FLAGS.rechunk else out
-            else:
-                return self.data
-        else:
-            file_path = inputs[self.file_path.k] if isinstance(self.file_path, OperandRef) else self.file_path
-            read_args = _resolve_args(self.read_args, inputs) if self.read_args else []
-            read_kwargs = _resolve_kwargs(self.read_kwargs, inputs) if self.read_kwargs else {}
-            if FLAGS.force_polars:
-                if self.format == "parquet":
-                    return pl.read_parquet(file_path, *read_args, **read_kwargs)
-                return pl.read_csv(file_path, *read_args, **read_kwargs)
-            else:
-                if self.format == "csv":
-                    return pd.read_csv(file_path, *read_args, **read_kwargs)
-                elif self.format == "parquet":
-                    return pd.read_parquet(file_path, *read_args, **read_kwargs)
-                elif self.format == "npy":
-                    return np.load(file_path, *read_args, **read_kwargs)
-                else:
-                    raise ValueError(f"Unsupported format: {self.format}")
 
     def clone(self):
         raise ValueError(f"We should not clone DataSourceOp objects.")

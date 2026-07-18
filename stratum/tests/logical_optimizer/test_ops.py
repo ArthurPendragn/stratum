@@ -21,6 +21,9 @@ from stratum.optimizer.ir._numeric_ops import NumericOp, NumericOpType
 from stratum.optimizer.ir._selection_ops import SelectionOp, SelectionKind
 from stratum.optimizer.ir._column_expr import BinOpExpr, Col, OperandLeaf
 from stratum.optimizer._optimize import optimize as optimize_
+from stratum.optimizer.ir._projection_ops import ApplyUDFOp
+from stratum.optimizer.physical._impl_selection import bind_op
+from stratum.optimizer.physical._plan_context import PlanContext
 
 
 class TestOpCloning(unittest.TestCase):
@@ -50,17 +53,20 @@ class TestOpCloning(unittest.TestCase):
         with st.config(fast_dataops_convert=True):
             ops, *_ = optimize_(choice.empty)
 
-        with self.assertRaises(ValueError):
+        # ops[0] is the physical source op; physical ops are never cloned.
+        with self.assertRaises(TypeError):
             ops[0].clone()
 
-        cloned = ops[1].clone()
-        self.assertIsNot(cloned, ops[1])
-        self.assertEqual(ops[1].args, cloned.args)
-        self.assertEqual(ops[1].columns, cloned.columns)
+        # Cloning is a logical-phase operation (choice unrolling): logical ops
+        # clone with their config preserved. In the optimized plan above these
+        # have been swapped to physical impls, which refuse cloning (as asserted
+        # for ops[0]).
+        udf = ApplyUDFOp(args=(1,), kwargs={}, columns=["a"])
+        self.assertEqual((1,), udf.clone().args)
+        self.assertEqual(["a"], udf.clone().columns)
 
-        cloned = ops[2].clone()
-        self.assertIsNot(cloned, ops[2])
-        self.assertEqual(ops[2].key, cloned.key)
+        getitem = GetItemOp(key="a")
+        self.assertEqual("a", getitem.clone().key)
 
         cloned = ops[3].clone()
         self.assertIsNot(ops[3].estimator, cloned.estimator)
@@ -236,6 +242,7 @@ class TestOpProcess(unittest.TestCase):
     def test_getitem_with_placeholder(self):
         # input 0 is the container, input 1 is the graph-fed key.
         op = GetItemOp(key=OperandRef(1))
+        bind_op(op, PlanContext.from_flags())  # GetItemOp executes via its physical impl
         result = op.process("fit_transform", [{"x": 42}, "x"])
         self.assertEqual(result, 42)
 

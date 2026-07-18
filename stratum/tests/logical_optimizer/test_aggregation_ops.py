@@ -53,7 +53,7 @@ class TestAggregateOp(unittest.TestCase):
 
     def test_str(self):
         op = AggregateOp(grouping_attributes="g", aggregations="sum")
-        self.assertIn("AggregateOp", str(op))
+        self.assertIn("Aggregation", str(op))
         self.assertIn("g", str(op))
 
     def test_polars_not_implemented(self):

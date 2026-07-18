@@ -1,9 +1,11 @@
 from collections.abc import Sequence
 from stratum.optimizer.ir._ops import OperandRef, OutputType, MethodCallOp, Op
-from stratum._config import FLAGS
 
 
 class JoinOp(Op):
+    """Logical join. Pure config -- execution is provided by the physical impls
+    in ``physical/_join_execs.py`` (Pandas/PolarsJoinOp), selected at plan time."""
+    logical_family = "Join"
     fields = ["how", "left_on", "right_on", "left_index", "right_index", "suffixes"]
 
     def __init__(
@@ -25,63 +27,6 @@ class JoinOp(Op):
         self.right_index = right_index
         self.suffixes = suffixes
         self.output_type = OutputType.FRAME
-
-    def process(self, mode: str, inputs: list):
-        if len(inputs) != 2:
-            raise ValueError(f"JoinOp expects exactly 2 inputs (left and right dataframes), got {len(inputs)}.")
-        left_df = inputs[0]
-        right_df = inputs[1]
-
-        if FLAGS.force_polars:
-            if self.left_index or self.right_index:
-                raise NotImplementedError("JoinOp Polars backend does not support index-based joins.")
-            if self.how not in ("inner", "left", "outer"):
-                raise NotImplementedError(
-                    f"JoinOp Polars backend does not support how={self.how!r}."
-                )
-            no_defined_join_columns = self.left_on is None and self.right_on is None
-            if not no_defined_join_columns and not isinstance(self.left_on, (str, list, tuple)):
-                raise NotImplementedError(
-                    f"JoinOp Polars backend does not support left_on of type "
-                    f"{type(self.left_on).__name__}."
-                )
-
-            left_columns_list = list(left_df.columns)
-            common_columns = [col for col in right_df.columns if col in left_columns_list]
-            how = "full" if self.how == "outer" else self.how
-            left_on = common_columns if no_defined_join_columns else self.left_on
-            right_on = common_columns if no_defined_join_columns else self.right_on
-
-            result = left_df.join(
-                right_df,
-                how=how,
-                left_on=left_on,
-                right_on=right_on,
-                suffix=self.suffixes[1],
-                coalesce = self.left_on == self.right_on # keep the different key-rows and get rid off identical ones 
-            )
-            if no_defined_join_columns:
-                return result
-            if isinstance(self.left_on, str):
-                key_cols = {self.left_on, self.right_on}
-            else:  # list/tuple, validated above
-                key_cols = set(self.left_on) | set(self.right_on)
-            mapping = {
-                col: col + self.suffixes[0]
-                for col in common_columns
-                if col not in key_cols
-            }
-            return result.rename(mapping=mapping)
-        else:
-            return left_df.merge(
-                right_df,
-                left_on=self.left_on,
-                right_on=self.right_on,
-                how=self.how,
-                suffixes=self.suffixes,
-                left_index=self.left_index,
-                right_index=self.right_index
-            )
 
 
 _MERGE_POSITIONAL = ["how", "on", "left_on", "right_on",

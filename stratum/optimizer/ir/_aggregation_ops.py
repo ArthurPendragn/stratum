@@ -1,5 +1,4 @@
 from stratum.optimizer.ir._ops import OperandRef, OutputType, MethodCallOp, Op
-from stratum._config import FLAGS
 
 
 class AggregateOp(Op):
@@ -9,29 +8,27 @@ class AggregateOp(Op):
     (e.g. ``.agg("mean")``, ``.sum()``, ``.mean()``, ``.count()``) as one op.
     Both the direct methods and ``.agg(spec)`` are normalized to ``aggregations``
     so ``grouped.agg(aggregations)`` reproduces the original result.
+
+    Pure config -- execution is provided by the physical impls in
+    ``physical/_aggregation_execs.py`` (PandasAggregateOp; polars pending),
+    selected at plan time.
     """
+    logical_family = "Aggregation"
     fields = ["grouping_attributes", "aggregations", "groupby_kwargs"]
 
     def __init__(self, grouping_attributes: str | list[str] | OperandRef,
                  aggregations: str | list[str] | dict | OperandRef,
                  groupby_kwargs: dict | None = None,
                  inputs: list[Op] | None = None, outputs: list[Op] | None = None):
-        super().__init__(name="", inputs=inputs, outputs=outputs)
+        # by/agg go in the name so the base helper renders them for both the
+        # logical family ("Aggregation(by=..., agg=...)") and the bound physical
+        # impl ("PandasAggregateOp(by=..., agg=...)").
+        super().__init__(name=f"by={grouping_attributes}, agg={aggregations}",
+                         inputs=inputs, outputs=outputs)
         self.grouping_attributes = grouping_attributes
         self.aggregations = aggregations
         self.groupby_kwargs = groupby_kwargs or {}
         self.output_type = OutputType.FRAME
-
-    def __str__(self):
-        return f"AggregateOp(by={self.grouping_attributes}, agg={self.aggregations}) [df]"
-
-    def process(self, mode: str, inputs: list):
-        _obj = inputs[0]
-        grouping = inputs[self.grouping_attributes.k] if isinstance(self.grouping_attributes, OperandRef) else self.grouping_attributes
-        aggregations = inputs[self.aggregations.k] if isinstance(self.aggregations, OperandRef) else self.aggregations
-        if FLAGS.force_polars:
-            raise NotImplementedError("AggregateOp Polars backend is not implemented yet.")
-        return _obj.groupby(grouping, **self.groupby_kwargs).agg(aggregations)
 
 
 class GroupedDataframeOp(Op):

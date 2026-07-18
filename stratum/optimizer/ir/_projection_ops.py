@@ -1,13 +1,7 @@
 from typing import Callable
 from skrub.selectors._base import make_selector
-from stratum.optimizer.ir._ops import (OperandRef, OutputType, CallOp, GetAttrOp,
+from stratum.optimizer.ir._ops import (OutputType, CallOp, GetAttrOp,
                                        MethodCallOp, Op, TransformerOp, _resolve_args, _resolve_kwargs)
-from stratum._config import FLAGS
-import pandas as pd
-import polars as pl
-from numpy import sin, cos
-import logging
-logger = logging.getLogger(__name__)
 
 
 def resolve_selector_columns(frame, selector) -> list[str]:
@@ -63,19 +57,6 @@ def polars_datetime_kwargs(args, kwargs) -> dict | None:
     return translated
 
 
-def _to_datetime_via_pandas(obj, args, kwargs):
-    """Preserve pandas datetime semantics for options Polars cannot express."""
-    name = getattr(obj, "name", None)
-    if isinstance(obj, (pl.Series, pl.DataFrame)):
-        obj = obj.to_pandas()
-    result = pd.to_datetime(obj, *args, **kwargs)
-    if isinstance(result, (pd.Series, pd.DataFrame)):
-        return pl.from_pandas(result)
-    if isinstance(result, pd.Index):
-        return pl.Series(name, result)
-    return result
-
-
 class MetadataOp(Op):
     fields = ["func", "args", "kwargs"]
 
@@ -88,19 +69,9 @@ class MetadataOp(Op):
         self.kwargs = kwargs
         self.output_type = OutputType.FRAME
 
-    def process(self, mode: str, inputs: list):
-        _obj = inputs[0]
-        _args = _resolve_args(self.args, inputs)
-        _kwargs = _resolve_kwargs(self.kwargs, inputs)
-        if FLAGS.force_polars:
-            if "columns" in _kwargs:
-                _args.append(_kwargs["columns"])
-            return getattr(_obj, self.func)(*_args)
-        else:
-            return getattr(_obj, self.func)(*_args, **_kwargs)
-
 
 class ProjectionOp(Op):
+    logical_family = "Projection"
     fields = ["func", "method", "args", "kwargs", "columns"]
 
     def __init__(self, func: Callable | None = None, method: str | None = None,
@@ -134,15 +105,9 @@ class ProjectionOp(Op):
         _kwargs = _resolve_kwargs(self.kwargs, inputs)
         return _obj, _args, _kwargs
 
-    def process(self, mode: str, inputs: list):
-        _obj, _args, _kwargs = self._extract_args_and_kwargs(inputs)
-        if self.method is not None:
-            if FLAGS.force_polars:
-                raise ValueError(f"Unsupported method: {self.method}")
-            return getattr(_obj, self.method)(*_args, **_kwargs)
-        if self.func is not None:
-            return self.func(_obj, *_args, **_kwargs)
-        raise TypeError("ProjectionOp requires either `func` or `method` to be set.")
+    # Execution lives in the physical impls (physical/_projection_execs.py);
+    # the logical op only carries config + the backend-agnostic operand plumbing
+    # (`_extract_args_and_kwargs`).
 
 
 class DropOp(ProjectionOp):
@@ -151,18 +116,6 @@ class DropOp(ProjectionOp):
         inputs: list[Op] = None, outputs: list[Op] = None, columns: list[str] = None):
         super().__init__(args=args, kwargs=kwargs, inputs=inputs, outputs=outputs, columns=columns)
 
-    def process(self, mode: str, inputs: list):
-        _obj, _args, _kwargs = self._extract_args_and_kwargs(inputs)
-
-        if FLAGS.force_polars:
-            if "columns" in _kwargs:
-                _args.append(_kwargs["columns"])
-            if "ignore_errors" in _kwargs:
-                _args.append(_kwargs["ignore_errors"] == "raise")
-            return _obj.drop(*_args)
-        else:
-            return _obj.drop(*_args, **_kwargs)
-
 
 class ColumnSelectorOp(Op):
     """A column selection by (deferred) skrub selector: keeps rows, restricts columns.
@@ -170,6 +123,7 @@ class ColumnSelectorOp(Op):
     Produced from ``skb.select(cols)``. Matches ``SelectCols`` semantics: the selector resolves against the schema at
     fit time and the *stored* column list is reused at predict time.
     """
+    logical_family = "Projection"
     fields = ["selector"]
 
     def __init__(self, selector, inputs: list[Op] = None, outputs: list[Op] = None):
@@ -177,18 +131,6 @@ class ColumnSelectorOp(Op):
         self.selector = selector
         self.selected_columns = None
         self.output_type = OutputType.FRAME
-
-    def process(self, mode: str, inputs: list):
-        frame = inputs[0]
-        if mode == "fit_transform":
-            self.selected_columns = resolve_selector_columns(frame, self.selector)
-        elif self.selected_columns is None:
-            raise RuntimeError(
-                f"{self} was asked to transform before the selector was resolved; "
-                f"run fit_transform first.")
-        if FLAGS.force_polars:
-            return frame.select(self.selected_columns)
-        return frame[self.selected_columns]
 
 
 def make_column_selector_op(op: TransformerOp) -> ColumnSelectorOp:
@@ -200,39 +142,43 @@ def make_column_selector_op(op: TransformerOp) -> ColumnSelectorOp:
     return new_op
 
 
+class ColumnProjectionOp(Op):
+    """Column selection by literal name(s): ``df[key]`` where ``key`` is a
+    column label or list of labels.
+
+    The specialised, always-column form of a ``df[...]`` indexing: produced from
+    a :class:`~stratum.optimizer.ir._ops.GetItemOp` whose container is a
+    ``FRAME`` and whose key is a literal ``str`` (a single column -> ``SERIES``)
+    or ``list[str]`` (a sub-frame -> ``FRAME``). Unlike :class:`ColumnSelectorOp`
+    (``skb.select``, a deferred skrub selector resolved against the schema), the
+    columns are given verbatim, so no fit-time resolution is needed. The general
+    ``GetItemOp`` stays the fallback for masks, graph-fed keys, slices and
+    positional indexing.
+    """
+    logical_family = "Projection"
+    fields = ["key"]
+
+    def __init__(self, key, inputs: list[Op] = None, outputs: list[Op] = None):
+        super().__init__(name=f"cols[{key!r}]", inputs=inputs, outputs=outputs)
+        self.key = key
+        # A single label extracts a column (SERIES); a list selects a sub-frame.
+        self.output_type = (OutputType.SERIES if isinstance(key, str)
+                            else OutputType.FRAME)
+
+
+def make_column_projection_op(op) -> ColumnProjectionOp:
+    """Rewrite a column-selecting ``df[key]`` :class:`GetItemOp` (a literal
+    ``str`` / ``list[str]`` key on a frame) into a :class:`ColumnProjectionOp`."""
+    new_op = ColumnProjectionOp(key=op.key, inputs=op.inputs, outputs=op.outputs)
+    op.replace_output_of_inputs(new_op)
+    return new_op
+
+
 class ApplyUDFOp(ProjectionOp):
     fields = ["args", "kwargs", "columns"]
     def __init__(self, args: tuple | list = (), kwargs: dict = {},
         inputs: list[Op] = None, outputs: list[Op] = None, columns: list[str] = None):
         super().__init__(args=args, kwargs=kwargs, inputs=inputs, outputs=outputs, columns=columns)
-
-    def process(self, mode: str, inputs: list):
-        _obj, _args, _kwargs = self._extract_args_and_kwargs(inputs)
-
-        n_cols = None
-        if self.columns:
-            _obj = _obj[self.columns]
-            if type(self.columns) == str:
-                n_cols = 1
-            else:
-                n_cols = len(self.columns)
-
-        if FLAGS.force_polars:
-            if isinstance(_obj, pl.Series):
-                n_cols = 1
-            if n_cols == 1:
-                if _args[0] == sin:
-                    logger.debug("Rewrite UDF sin to polars sin")
-                    return _obj.sin()
-                elif _args[0] == cos:
-                    logger.debug("Rewrite UDF cos to polars cos")
-                    return _obj.cos()
-                else:
-                    return _obj.map_elements(*_args, **_kwargs)
-            else:
-                return _obj.map_rows(*_args, **_kwargs)
-        else:
-            return _obj.apply(*_args, **_kwargs)
 
 
 class AssignOp(ProjectionOp):
@@ -240,40 +186,12 @@ class AssignOp(ProjectionOp):
         inputs: list[Op] = None, outputs: list[Op] = None, columns: list[str] = None):
         super().__init__(args=args, kwargs=kwargs, inputs=inputs, outputs=outputs, columns=columns)
 
-    def process(self, mode: str, inputs: list):
-        _obj, _args, _kwargs = self._extract_args_and_kwargs(inputs)
-        if FLAGS.force_polars:
-            checked_kwargs = {}
-            for k, v in _kwargs.items():
-                if isinstance(v, OperandRef):
-                    raise NotImplementedError("Is not yet suppoerted, please report this issue")
-                elif isinstance(v, pd.Series) or isinstance(v, pd.DataFrame):
-                    logger.warning(f"Converting pandas object to polars object for column {k}")
-                    checked_kwargs[k] = pl.from_pandas(v)
-                elif isinstance(v, list):
-                    checked_kwargs[k] = pl.Series(v)
-                else:
-                    checked_kwargs[k] = v
-            return _obj.with_columns(*_args, **checked_kwargs)
-        else:
-            return _obj.assign(*_args, **_kwargs)
-
 
 class DatetimeConversionOp(ProjectionOp):
     def __init__(self, args: tuple | list = (), kwargs: dict = {},
         inputs: list[Op] = None, outputs: list[Op] = None, columns: list[str] = None):
         super().__init__(args=args, kwargs=dict(kwargs or {}), inputs=inputs,
                          outputs=outputs, columns=columns)
-
-    def process(self, mode: str, inputs: list):
-        if FLAGS.force_polars:
-            translated = polars_datetime_kwargs(self.args, self.kwargs)
-            if translated is not None:
-                # TODO: Support already-datetime and numeric operands natively;
-                # the Polars string namespace only accepts string input.
-                return inputs[0].str.to_datetime(**translated)
-            return _to_datetime_via_pandas(inputs[0], self.args, self.kwargs)
-        return pd.to_datetime(inputs[0], *self.args, **self.kwargs)
 
 
 class StringMethodOp(ProjectionOp):
@@ -296,15 +214,9 @@ class StringMethodOp(ProjectionOp):
         super().__init__(method=method, args=args, kwargs=kwargs or {},
                          inputs=inputs, outputs=outputs, columns=columns)
 
-    def process(self, mode: str, inputs: list):
-        _obj, _args, _kwargs = self._extract_args_and_kwargs(inputs)
-        name = self.method
-        if FLAGS.force_polars:
-            name = STR_POLARS_METHODS.get(name, name)
-        return getattr(_obj.str, name)(*_args, **_kwargs)
-
 
 class GetAttrProjectionOp(Op):
+    logical_family = "Projection"
     fields = ["attr_name"]
 
     # NOTE: Polars and Pandas differ in semantics for some datetime attributes:
@@ -324,33 +236,6 @@ class GetAttrProjectionOp(Op):
         self.inputs = inputs
         self.outputs = outputs
         self.output_type = OutputType.FRAME
-
-    def __str__(self):
-        attr_name = ".".join(self.attr_name)
-        return f"GetAttrProjectionOp({attr_name}) [df]"
-
-    def process(self, mode: str, inputs: list):
-        result = inputs[0]
-        tmp = result
-        if FLAGS.force_polars:
-            for attr in self.attr_name:
-                attr = self.POLARS_ATTR_NAME_MAP.get(attr, attr)
-
-                # TODO find better way to handle this
-                if attr == "is_month_end":
-                    return result.dt.month_end() == result
-
-                # polars implements dt.day as a method, not an attribute
-                # use getattr to handle both attributes and methods
-                tmp = getattr(tmp, attr)
-            if len(self.attr_name) == 2:
-                return tmp()
-            else:
-                return tmp
-        else:
-            for attr in self.attr_name:
-                tmp = getattr(tmp, attr)
-            return tmp
 
 
 def make_datetime_conversion_op(op: CallOp) -> DatetimeConversionOp:

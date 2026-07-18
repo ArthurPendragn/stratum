@@ -4,9 +4,7 @@ from pandas import DataFrame
 from polars import DataFrame as PolarsDataFrame
 from skrub import SelectCols
 import pandas as pd
-import polars as pl
 import numpy as np
-from stratum._config import FLAGS
 
 # Per-category frame ops. These are imported here both because the
 # `extract_dataframe_op` dispatcher below references them and so that existing
@@ -19,10 +17,11 @@ from stratum.optimizer.ir._aggregation_ops import (
     AggregateOp, GroupedDataframeOp, _AGG_METHODS, _AGG_FUNCS, _is_groupby_op,
     _is_aggregation, _extract_grouping, _extract_aggregations, make_aggregate_op)
 from stratum.optimizer.ir._projection_ops import (
-    ColumnSelectorOp, MetadataOp, ProjectionOp, DropOp, ApplyUDFOp, AssignOp,
-    DatetimeConversionOp, GetAttrProjectionOp, StringMethodOp,
-    make_column_selector_op, make_datetime_conversion_op, make_frame_get_attr,
-    make_string_method_op, resolve_selector_columns)
+    ColumnProjectionOp, ColumnSelectorOp, MetadataOp, ProjectionOp, DropOp,
+    ApplyUDFOp, AssignOp, DatetimeConversionOp, GetAttrProjectionOp,
+    StringMethodOp, make_column_projection_op, make_column_selector_op,
+    make_datetime_conversion_op, make_frame_get_attr, make_string_method_op,
+    resolve_selector_columns)
 from stratum.optimizer.ir._map_ops import MapOp, AssignMapOp, make_assign_map_op
 from stratum.optimizer.ir._join_ops import (
     JoinOp, _MERGE_POSITIONAL, _JOIN_POSITIONAL, _JOIN_OP_FIELDS, make_join_op,
@@ -31,28 +30,21 @@ from stratum.optimizer.ir._split_ops import SplitOp, SplitOutput, add_splitting_
 
 
 class ConcatOp(Op):
+    """Logical frame concatenation. Pure config -- execution is provided by the
+    physical impls in ``physical/_concat_execs.py`` (Pandas/PolarsConcatOp),
+    selected at plan time."""
+    logical_family = "Concat"
     fields = ["first", "others", "axis"] # Add more if needed
 
-    axis_map = {
-        0: "diagonal_relaxed",
-        1: "horizontal",
-    }
     def __init__(self, first, others: list, axis):
-        super().__init__(name="CONCAT", is_X=False, is_y=False)
+        # No name: the "Concat" family label alone renders cleanly (avoids the
+        # redundant "Concat(CONCAT)").
+        super().__init__(name="", is_X=False, is_y=False)
         # first/others entries/axis are OperandRefs when graph-fed, else constants.
         self.first = first
         self.others = list(others)
         self.axis = axis
         self.output_type = OutputType.FRAME
-
-    def process(self, mode: str, inputs: list):
-        first = inputs[self.first.k] if isinstance(self.first, OperandRef) else self.first
-        others = [inputs[o.k] if isinstance(o, OperandRef) else o for o in self.others]
-        axis = inputs[self.axis.k] if isinstance(self.axis, OperandRef) else self.axis
-        if FLAGS.force_polars:
-            return pl.concat([first, *others], how=self.axis_map[axis])
-        else:
-            return pd.concat([first, *others], axis=axis)
 
 
 def _getitem_output_type(op: GetItemOp) -> OutputType:
@@ -73,7 +65,24 @@ def _getitem_output_type(op: GetItemOp) -> OutputType:
     return OutputType.FRAME
 
 
-def extract_dataframe_op(op: Op, root: Op, selection_op = True, map_op = True) -> tuple[Op, bool]:
+def _is_column_projection(op: GetItemOp) -> bool:
+    """Whether a ``df[key]`` GetItem selects columns by literal name(s).
+
+    True only when the container is a ``FRAME`` and the key is a literal column
+    label (``str``) or list of labels (``list[str]``). A graph-fed key (an
+    :class:`OperandRef`), a slice, an integer/positional key, a boolean-mask list
+    or a ``SERIES`` container all fall through to the general ``GetItemOp``.
+    """
+    if op.inputs[0].output_type is not OutputType.FRAME:
+        return False
+    key = op.key
+    if isinstance(key, str):
+        return True
+    return isinstance(key, list) and all(isinstance(k, str) for k in key)
+
+
+def extract_dataframe_op(op: Op, root: Op, selection_op = True, map_op = True,
+                         column_projection = True) -> tuple[Op, bool]:
     new_op = None
     # DataSource detection (directly passed dataframe)
     if len(op.inputs) == 0:
@@ -157,6 +166,11 @@ def extract_dataframe_op(op: Op, root: Op, selection_op = True, map_op = True) -
                 op.is_filter = True
                 if selection_op:
                     new_op = make_mask_selection_op(op)
+            elif column_projection and _is_column_projection(op):
+                # A literal column selection df["a"] / df[["a", "b"]] on a frame
+                # becomes a dedicated ColumnProjectionOp; GetItem stays the
+                # fallback for masks, graph-fed keys, slices and positional keys.
+                new_op = make_column_projection_op(op)
 
             if new_op is None:
                 op.output_type = _getitem_output_type(op)

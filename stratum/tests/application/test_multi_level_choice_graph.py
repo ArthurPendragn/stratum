@@ -1,5 +1,3 @@
-import os
-import tempfile
 import unittest
 import uuid
 
@@ -12,6 +10,8 @@ from lightgbm import LGBMRegressor
 from xgboost import XGBRegressor
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.metrics import make_scorer, r2_score
+
+from stratum.tests._helpers import csv_file
 
 
 class TargetEncoder(BaseEstimator, TransformerMixin):
@@ -113,24 +113,20 @@ def make_data(n: int = 1000):
 class TestMultiLevelChoiceGraph(unittest.TestCase):
 
     def test_application(self):
-        tmp_path = tempfile.mkdtemp()
-        df = make_data()
-        df.to_csv(os.path.join(tmp_path, "data.csv"), index=False)
-        preds = define_pipeline(os.path.join(tmp_path, "data.csv"))
         scorer = make_scorer(r2_score)
-        with st.config(DEBUG=True, debug_graph=False, scheduler=True, rust_backend=False):
-            search = preds.skb.make_grid_search(fitted=True, cv = 2, scoring=scorer)
-            self.assertIsNotNone(search.results_)
-            self.assertGreater(len(search.results_), 0)
+        with csv_file(make_data()) as path:
+            preds = define_pipeline(path)
+            with st.config(DEBUG=True, debug_graph=False, scheduler=True, rust_backend=False):
+                search = preds.skb.make_grid_search(fitted=True, cv = 2, scoring=scorer)
+                self.assertIsNotNone(search.results_)
+                self.assertGreater(len(search.results_), 0)
 
 
     def test_application_polars(self):
-        tmp_path = tempfile.mkdtemp()
-        df = make_data()
-        df.to_csv(os.path.join(tmp_path, "data.csv"), index=False)
-        preds = define_pipeline(os.path.join(tmp_path, "data.csv"))
         scorer = make_scorer(r2_score)
-        with st.config(DEBUG=False, open_graph=False, scheduler=True, rust_backend=False, force_polars=True):
-            search = preds.skb.make_grid_search(fitted=True, cv = 2, scoring=scorer)
-            self.assertIsNotNone(search.results_)
-            self.assertGreater(len(search.results_), 0)
+        with csv_file(make_data()) as path:
+            preds = define_pipeline(path)
+            with st.config(DEBUG=False, open_graph=False, scheduler=True, rust_backend=False, force_polars=True):
+                search = preds.skb.make_grid_search(fitted=True, cv = 2, scoring=scorer)
+                self.assertIsNotNone(search.results_)
+                self.assertGreater(len(search.results_), 0)

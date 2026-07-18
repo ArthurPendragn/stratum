@@ -20,8 +20,8 @@ import pandas as pd
 
 from stratum.optimizer.ir._ops import OperandRef, BinOp, UnaryOp, GetItemOp, Op
 from stratum.optimizer.ir._projection_ops import (
-    DatetimeConversionOp, GetAttrProjectionOp, StringMethodOp, STR_POLARS_METHODS,
-    polars_datetime_kwargs)
+    ColumnProjectionOp, DatetimeConversionOp, GetAttrProjectionOp, StringMethodOp,
+    STR_POLARS_METHODS, polars_datetime_kwargs)
 
 # operator callable -> symbol. A binary/unary op whose callable is not in the
 # corresponding map is not foldable into a column expression.
@@ -401,9 +401,10 @@ class _Folder:
             return node.op in BINARY_SYMBOLS
         if isinstance(node, UnaryOp):
             return node.op in UNARY_SYMBOLS
-        if isinstance(node, GetItemOp):
-            # A column of the source frame: df["col"]. Anything else (a chained
-            # getitem, a non-string key) is not a Col leaf.
+        if isinstance(node, (GetItemOp, ColumnProjectionOp)):
+            # A single column of the source frame: df["col"] (a bare GetItem, or
+            # its rewritten ColumnProjectionOp form). Anything else (a chained
+            # getitem, a list/sub-frame key, a non-string key) is not a Col leaf.
             return (isinstance(node.key, str) and bool(node.inputs)
                     and node.inputs[0] is self.src)
         if isinstance(node, StringMethodOp):
@@ -523,7 +524,7 @@ class _Folder:
         if isinstance(node, UnaryOp):
             return UnaryOpExpr(node.op,
                                self._operand(node.operand, node, absorbable, memo))
-        if isinstance(node, GetItemOp):
+        if isinstance(node, (GetItemOp, ColumnProjectionOp)):
             return Col(node.key)
         if isinstance(node, StringMethodOp):
             # The .str accessor was fused away in frame extraction, so the column is

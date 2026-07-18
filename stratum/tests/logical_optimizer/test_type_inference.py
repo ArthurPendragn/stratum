@@ -6,9 +6,11 @@ import pandas as pd
 import stratum as st
 from stratum.optimizer._optimize import OptConfig
 from stratum.optimizer.ir._dataframe_ops import (
-    ApplyUDFOp, DataSourceOp, DatetimeConversionOp, GetAttrProjectionOp)
+    ApplyUDFOp, ColumnProjectionOp, DatetimeConversionOp, GetAttrProjectionOp)
 from stratum.optimizer.ir._ops import GetItemOp, OutputType, BinOp
-from stratum.tests.logical_optimizer.test_dataframe_ops import optimize, npy_file
+from stratum.optimizer.physical._source_execs import NumpyLoad
+from stratum.tests._helpers import npy_file
+from stratum.tests.logical_optimizer.test_dataframe_ops import optimize
 
 
 class TestOutputTypeInference(unittest.TestCase):
@@ -31,16 +33,19 @@ class TestOutputTypeInference(unittest.TestCase):
         return found[0]
 
     def test_column_selection_is_series(self):
+        # df["x"] on a frame is a single-column projection -> a SERIES-typed
+        # ColumnProjectionOp (the GetItem is rewritten away).
         ops = optimize(st.as_data_op(self.df)["x"], OptConfig(dataframe_ops=True))
-        getitems = self._find(ops, GetItemOp)
-        self.assertEqual(1, len(getitems))
-        self.assertIs(OutputType.SERIES, getitems[0].output_type)
+        projections = self._find(ops, ColumnProjectionOp)
+        self.assertEqual(1, len(projections))
+        self.assertIs(OutputType.SERIES, projections[0].output_type)
 
     def test_multi_column_projection_is_frame(self):
+        # df[["x", "y"]] selects a sub-frame -> a FRAME-typed ColumnProjectionOp.
         ops = optimize(st.as_data_op(self.df)[["x", "y"]], OptConfig(dataframe_ops=True))
-        getitems = self._find(ops, GetItemOp)
-        self.assertEqual(1, len(getitems))
-        self.assertIs(OutputType.FRAME, getitems[0].output_type)
+        projections = self._find(ops, ColumnProjectionOp)
+        self.assertEqual(1, len(projections))
+        self.assertIs(OutputType.FRAME, projections[0].output_type)
 
     def test_comparison_on_column_is_series(self):
         # df["x"] > 1 : the column is a SERIES, so the comparison is a SERIES too.
@@ -50,10 +55,11 @@ class TestOutputTypeInference(unittest.TestCase):
         self.assertIs(OutputType.SERIES, binops[0].output_type)
 
     def test_npy_source_is_matrix(self):
+        # An npy read lowers to the physical NumpyLoad source, which is a MATRIX.
         with npy_file(np.array([1, 2, 3])) as path:
             data = st.as_data_op(path).skb.apply_func(np.load)
             ops = optimize(data, OptConfig(dataframe_ops=True))
-        sources = [o for o in ops if isinstance(o, DataSourceOp)]
+        sources = [o for o in ops if isinstance(o, NumpyLoad)]
         self.assertEqual(1, len(sources))
         self.assertIs(OutputType.MATRIX, sources[0].output_type)
 

@@ -7,17 +7,16 @@ The op-specific tests live alongside their module: ``test_source_ops``,
 import the helpers below from here, mirroring how ``_dataframe_ops`` re-exports the
 per-category ops.
 """
-import os
-import tempfile
 import unittest
 from contextlib import contextmanager
 
-import numpy as np
 import polars as pl
 from stratum._config import FLAGS
 from stratum.optimizer._optimize import OptConfig, optimize as optimize_
 from stratum.optimizer.ir._dataframe_ops import ConcatOp
 from stratum.optimizer.ir._ops import OperandRef, OutputType, Op
+from stratum.optimizer.physical._impl_selection import bind_op
+from stratum.optimizer.physical._plan_context import PlanContext
 
 
 def optimize(dag, conf=None, env=None):
@@ -37,8 +36,17 @@ def _inputs_for(op):
 
 
 def run_op(op, *values, mode="fit_transform"):
-    """Wire `values` as op.inputs (wrapped via `_inp`) and run `op.process`."""
+    """Wire `values` as op.inputs, bind the op's physical impl per the current
+    flags, and run its ``process``.
+
+    Binding mirrors what the optimizer's selection pass does: a migrated op
+    (e.g. ``ConcatOp``) is swapped to its backend-specific physical impl chosen
+    from ``FLAGS``; an un-migrated op keeps its own ``process``. This lets the
+    same ``run_op(SomeOp(...), df)`` tests exercise the physical impls without
+    each test having to construct the concrete class itself.
+    """
     op.inputs = [_inp(v) for v in values]
+    bind_op(op, PlanContext.from_flags())
     return op.process(mode, _inputs_for(op))
 
 
@@ -62,42 +70,6 @@ def force_polars(enabled=True):
         yield
     finally:
         FLAGS.force_polars = orig
-
-
-@contextmanager
-def csv_file(df, **to_csv_kwargs):
-    """Write `df` to a temp .csv file and yield its path; cleaned up on exit."""
-    tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w")
-    df.to_csv(tmp, index=False, **to_csv_kwargs)
-    tmp.close()
-    try:
-        yield tmp.name
-    finally:
-        os.remove(tmp.name)
-
-
-@contextmanager
-def npy_file(arr):
-    """Write `arr` to a temp .npy file and yield its path; cleaned up on exit."""
-    tmp = tempfile.NamedTemporaryFile(suffix=".npy", delete=False, mode="wb")
-    np.save(tmp, arr)
-    tmp.close()
-    try:
-        yield tmp.name
-    finally:
-        os.remove(tmp.name)
-
-
-@contextmanager
-def parquet_file(df):
-    """Write `df` to a temp .parquet file and yield its path; cleaned up on exit."""
-    tmp = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False, mode="wb")
-    df.to_parquet(tmp.name)
-    tmp.close()
-    try:
-        yield tmp.name
-    finally:
-        os.remove(tmp.name)
 
 
 class PolarsTestCase(unittest.TestCase):

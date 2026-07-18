@@ -1,8 +1,6 @@
 from enum import Enum, auto
-from stratum.optimizer.ir._ops import (OperandRef, OutputType, GetItemOp,
-                                       MethodCallOp, Op, _resolve_args, _resolve_kwargs)
-from stratum.optimizer.ir._column_expr import ColumnExpr, EvalContext, fold_column_expr
-from stratum._config import FLAGS
+from stratum.optimizer.ir._ops import OperandRef, OutputType, GetItemOp, MethodCallOp, Op
+from stratum.optimizer.ir._column_expr import ColumnExpr, fold_column_expr
 
 
 class SelectionKind(Enum):
@@ -43,6 +41,7 @@ class SelectionOp(Op):
 
     Method-based kinds use ``args``/``kwargs``; ``MASK``/``QUERY`` use ``predicate``.
     """
+    logical_family = "Selection"
     fields = ["kind", "args", "kwargs", "predicate"]
 
     def __init__(self, kind: SelectionKind, args: tuple | list = None, kwargs: dict = None,
@@ -58,34 +57,11 @@ class SelectionOp(Op):
         # stays a series); extraction overrides this with the propagated type.
         self.output_type = OutputType.FRAME
 
-    def __str__(self):
-        return f"SelectionOp({self.kind.name.lower()})"
-
-    def process(self, mode: str, inputs: list):
-        _obj = inputs[0]
-        if self.kind is SelectionKind.MASK:
-            ctx = EvalContext(frame=_obj, inputs=inputs, mode=mode)
-            if FLAGS.force_polars:
-                return _obj.filter(self.predicate.to_polars(ctx))
-            else:
-                if FLAGS.pandas_query:
-                    params = {}
-                    query = self.predicate.to_pandas_query(params)
-                    # None when the predicate isn't query-expressible (an OperandLeaf
-                    # or str accessor); fall through to boolean masking in that case.
-                    if query is not None:
-                        return _obj.query(query, local_dict=params)
-                predicate = self.predicate.to_pandas(ctx)
-                return _obj[predicate]
-        _args = _resolve_args(self.args, inputs) if self.args else []
-        _kwargs = _resolve_kwargs(self.kwargs, inputs) if self.kwargs else {}
-        table = _SELECTION_POLARS_METHOD if FLAGS.force_polars else _SELECTION_PANDAS_METHOD
-        method = table.get(self.kind)
-        if method is None:
-            raise NotImplementedError(
-                f"SelectionOp.process is not implemented for kind {self.kind.name}"
-                f"{' on the Polars backend' if FLAGS.force_polars else ''}.")
-        return getattr(_obj, method)(*_args, **_kwargs)
+    # No custom __str__: the base IRNode renders ``<class>(<name>) [df]`` from
+    # ``self.name`` (== the kind). While logical, it shows the ``Selection``
+    # family; once lowered, ``_is_physical`` flips the class-name component to the
+    # bound impl (PandasQuerySelectionOp, ...), so the plan reflects the selected
+    # backend instead of a hardcoded name.
 
 
 def make_selection_op(op: MethodCallOp) -> SelectionOp:

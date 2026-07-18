@@ -20,6 +20,30 @@ def _env_int(name, default=0):
     return int(v) if v is not None else int(default)
 
 
+#: IR levels the optimizer can print a linear plan for, in pipeline order:
+#: ``logical`` (after logical rewrites), ``physical`` (after lowering) and
+#: ``physical_impl`` (after implementation selection -- the executable plan).
+EXPLAIN_LEVELS = ("logical", "physical", "physical_impl")
+
+
+def _normalize_explain(value) -> tuple[str, ...]:
+    """Coerce the ``explain`` config into a tuple of IR levels to print.
+
+    ``None``/``False`` -> off; ``True`` -> the executable plan only
+    (``("physical_impl",)``); a level (or list of levels) -> those levels.
+    """
+    if value is None or value is False:
+        return ()
+    if value is True:
+        return ("physical_impl",)
+    levels = (value,) if isinstance(value, str) else tuple(value)
+    invalid = [lvl for lvl in levels if lvl not in EXPLAIN_LEVELS]
+    if invalid:
+        raise ValueError(
+            f"Invalid explain level(s) {invalid}; valid levels are {list(EXPLAIN_LEVELS)}.")
+    return levels
+
+
 @dataclass
 class _Flags:
     rust_backend: bool = _env_bool("SKRUB_RUST", False)
@@ -31,7 +55,7 @@ class _Flags:
     stats_top_k: int = 20
     debug_graph: bool = False
     open_graph: bool = False
-    explain_linear_plan: bool = False
+    explain: tuple[str, ...] = ()
     cse: bool = True
     DEBUG: bool = False
     force_polars: bool = _env_bool("STRATUM_FORCE_POLARS", False)
@@ -40,6 +64,7 @@ class _Flags:
     validate_dag: bool = True
     make_selection_op: bool = True
     make_map_op: bool = True
+    make_column_projection: bool = True
     rechunk: bool = True
     buffer_pool_memory_budget: int = 0
 
@@ -54,7 +79,7 @@ def set_config(rust_backend: bool | None = None,
     scheduler: bool = False,
     debug_graph: bool = False,
     open_graph: bool = False,
-    explain_linear_plan: bool = False,
+    explain: bool | str | list[str] | None = None,
     DEBUG: bool | None = None,
     force_polars: bool = False,
     pandas_query: bool = False,
@@ -63,6 +88,7 @@ def set_config(rust_backend: bool | None = None,
     validate_dag: bool = True,
     make_selection_op: bool = True,
     make_map_op: bool = True,
+    make_column_projection: bool = True,
     rechunk: bool = True,
 buffer_pool_memory_budget: int = 0
                ) -> None:
@@ -97,8 +123,12 @@ buffer_pool_memory_budget: int = 0
         open_graph: bool, default true
             Open the graph after optimization.
 
-        explain_linear_plan: bool, default false
-            Print a text-based linear execution plan after optimization.
+        explain: bool | str | list[str], default None
+            Print text-based linear execution plans during optimization. ``True``
+            prints the executable plan (equivalent to ``["physical_impl"]``); a
+            list selects which IR levels to print, any of ``"logical"`` (after
+            logical rewrites), ``"physical"`` (after lowering) and
+            ``"physical_impl"`` (after implementation selection).
 
         DEBUG: bool, default false
             Enable/disable debug mode.
@@ -146,9 +176,10 @@ buffer_pool_memory_budget: int = 0
     FLAGS.debug_graph = bool(debug_graph)
     FLAGS.open_graph = bool(open_graph)
     FLAGS.buffer_pool_memory_budget = int(buffer_pool_memory_budget)
-    FLAGS.explain_linear_plan = bool(explain_linear_plan)
+    FLAGS.explain = _normalize_explain(explain)
     FLAGS.make_selection_op = bool(make_selection_op)
     FLAGS.make_map_op = bool(make_map_op)
+    FLAGS.make_column_projection = bool(make_column_projection)
     FLAGS.rechunk = bool(rechunk)
 
     #FIXME: This should be the default. No need to set it. Remove.

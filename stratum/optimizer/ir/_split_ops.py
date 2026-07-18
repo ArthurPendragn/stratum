@@ -7,6 +7,8 @@ import numpy as np
 
 
 class SplitOp(Op):
+    logical_family = "Split"
+
     def __init__(self, inputs: list[Op]=None, outputs: list[Op]=None):
         super().__init__(name="Train/Test", is_X=False, is_y=False, inputs=inputs, outputs=outputs)
         self.is_split_op = True

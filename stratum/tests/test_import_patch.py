@@ -4,6 +4,7 @@ from skrub import StringEncoder
 import stratum as st
 from stratum.optimizer.ir._ops import TransformerOp
 from stratum.optimizer.physical import build_default_physical_registry
+from stratum.optimizer.physical._transform_execs import StringEncoderOp
 
 
 def test_skrub_and_sklearn_estimators_are_not_monkey_patched():
@@ -14,10 +15,14 @@ def test_skrub_and_sklearn_estimators_are_not_monkey_patched():
 def test_rust_estimators_are_registered_as_physical_operators():
     registry = build_default_physical_registry()
 
-    rust_candidates = registry.candidates_for(TransformerOp, backend_name="rust")
+    # OneHotEncoder is still keyed on the logical TransformerOp; StringEncoder has
+    # migrated to its own physical op with a class-based @rust_impl.
+    transformer_rust = registry.candidates_for(TransformerOp, backend_name="rust")
+    string_encoder_rust = registry.candidates_for(StringEncoderOp, backend_name="rust")
 
-    assert len(rust_candidates) == 2
-    assert {candidate.backend_name for candidate in rust_candidates} == {"rust"}
+    assert len(transformer_rust) == 1
+    assert len(string_encoder_rust) == 1
+    assert {c.backend_name for c in (*transformer_rust, *string_encoder_rust)} == {"rust"}
 
 
 def test_stratum_still_exposes_adapter_classes_for_direct_legacy_use():

@@ -1,6 +1,4 @@
 from __future__ import annotations
-from enum import Enum, auto
-from stratum._config import FLAGS
 from types import SimpleNamespace
 from typing import Callable
 
@@ -10,51 +8,20 @@ from sklearn.base import BaseEstimator
 from skrub._data_ops._choosing import Choice
 from skrub._data_ops._data_ops import DataOp, Apply, Value, CallMethod, Call, GetAttr, GetItem, BinOp as SkrubBinOp, UnaryOp as SkrubUnaryOp, Concat, Var, _wrap_estimator
 from skrub._utils import PassThrough
-from skrub.selectors._base import All
 from pandas import DataFrame
 from polars import DataFrame as PlDataFrame, Series as PlSeries
 from stratum.utils._skrub_graph import _collect_child_data_ops
+# Shared IR foundation. Re-exported below so existing ``from ..._ops import X``
+# call sites (OutputType, OperandRef, is_frame_like, config_key, ...) keep working.
+from stratum.optimizer.ir._base import (
+    IRNode, OutputType, FRAME_TYPES, is_frame_like, OperandRef,
+    _resolve_operand, _resolve_args, _resolve_kwargs, remap_operand_refs,
+    config_key, estimator_key, clone_value,
+    _ALL_SELECTOR_KEY, _GRAPH_PARAM_KEY,
+)
 import logging
 import os
 logger = logging.getLogger(__name__)
-
-
-class OutputType(Enum):
-    """The kind of value an :class:`Op` produces.
-
-    Replaces the old boolean ``is_dataframe_op`` flag with a small lattice so that
-    rewrites can distinguish a single column (``SERIES``) from a whole table
-    (``FRAME``). Telling the two apart is what lets selection detection recognise
-    ``df[mask]`` as a relational selection (the ``mask`` is a ``SERIES``).
-
-    Boolean-ness is *not* a separate output type: a boolean mask is just a
-    ``SERIES`` whose values happen to be booleans (a value-level property), so it
-    is tracked separately rather than as its own enum member.
-
-    ``UNKNOWN`` is the default (the op produces a non-tabular Python value, e.g. a
-    scalar or an arbitrary object) and corresponds to the old ``is_dataframe_op =
-    False``. ``MATRIX`` is ndarray-valued (e.g. ``np.load``) and is deliberately
-    *not* a frame type: numpy data is handled by the numeric extraction path, not
-    the dataframe path. (A ``VECTOR`` type will be added once we have an op that
-    produces one -- e.g. a GetItem/aggregation on a MATRIX.)
-    """
-    UNKNOWN = auto()
-    FRAME = auto()
-    SERIES = auto()
-    SCALAR = auto()
-    MATRIX = auto()
-
-
-# Output types that belong to the dataframe (pandas/polars) world. A frame and a
-# series are both manipulated by the dataframe extraction path; a MATRIX (numpy)
-# is not. Used to decide whether an op consumes already-produced frame data (a
-# dataframe operation) or a leaf/raw value (a read/source).
-FRAME_TYPES = frozenset({OutputType.FRAME, OutputType.SERIES})
-
-
-def is_frame_like(op) -> bool:
-    """True if ``op`` produces frame-world data (a frame or a series)."""
-    return op.output_type in FRAME_TYPES
 
 
 def _operand_index_from_impl(skrub_impl) -> dict:
@@ -71,31 +38,6 @@ def _operand_index_from_impl(skrub_impl) -> dict:
             if id(data_op) not in index:
                 index[id(data_op)] = len(index)
     return index
-
-class OperandRef:
-    """Explicit reference to the ``k``-th entry of an :class:`Op`'s ``inputs`` list.
-
-    Replaces the old opaque ``DATA_OP_PLACEHOLDER`` sentinel. Instead of relying on
-    the *order* in which placeholders are walked at runtime, an operand now carries
-    the exact index of the input that fills it, so ``process()`` can resolve
-    ``inputs[ref.k]`` directly and rewrites that reorder inputs are checkable.
-    """
-    __slots__ = ("k",)
-
-    def __init__(self, k: int):
-        self.k = k
-
-    def __eq__(self, other):
-        return isinstance(other, OperandRef) and other.k == self.k
-
-    def __hash__(self):
-        return hash(("OperandRef", self.k))
-
-    def __str__(self):
-        return f"${self.k}"
-
-    def __repr__(self):
-        return f"OperandRef({self.k})"
 
 
 class OperandBinder:
@@ -152,249 +94,17 @@ class OperandBinder:
         return {k: self.bind(v) for k, v in mapping.items()}
 
 
-def _resolve_operand(value, inputs):
-    """Recursively replace OperandRefs nested in value with values from inputs."""
-    if isinstance(value, OperandRef):
-        return inputs[value.k]
-    if isinstance(value, tuple):
-        return tuple(_resolve_operand(v, inputs) for v in value)
-    if isinstance(value, list):
-        return [_resolve_operand(v, inputs) for v in value]
-    if isinstance(value, dict):
-        return {k: _resolve_operand(v, inputs) for k, v in value.items()}
-    return value
+class Op(IRNode):
+    """Logical operator: a backend-agnostic node in the pre-lowering IR.
 
-
-def _resolve_args(args, inputs):
-    """Replace OperandRefs in an args sequence with values from the inputs list."""
-    return [_resolve_operand(a, inputs) for a in args]
-
-
-def _resolve_kwargs(kwargs, inputs):
-    """Replace OperandRefs in a kwargs dict with values from the inputs list."""
-    return {k: _resolve_operand(v, inputs) for k, v in kwargs.items()}
-
-
-def remap_operand_refs(value, mapping: dict):
-    """Return ``value`` with every nested :class:`OperandRef` remapped through
-    ``mapping`` (old input index -> new input index).
-
-    Recurses tuples/lists/dicts and column-expression trees (anything exposing a
-    ``remap_operand_refs`` method, e.g. a ``ColumnExpr`` predicate). This is the
-    single walker shared by CSE edge de-duplication (``_op_cse``) and
-    :meth:`Op._dedupe_input_refs`, so both renumber refs identically -- including
-    refs buried inside a ``ColumnExpr`` field.
+    Adds the two concerns specific to the logical layer on top of the shared
+    :class:`~stratum.optimizer.ir._base.IRNode` structure: CSE structure keys
+    and choice detection. Physical operators (post-lowering) share the same
+    ``IRNode`` base but not this class.
     """
-    if isinstance(value, OperandRef):
-        return OperandRef(mapping[value.k])
-    if isinstance(value, tuple):
-        return tuple(remap_operand_refs(v, mapping) for v in value)
-    if isinstance(value, list):
-        return [remap_operand_refs(v, mapping) for v in value]
-    if isinstance(value, dict):
-        return {k: remap_operand_refs(v, mapping) for k, v in value.items()}
-    if hasattr(value, "remap_operand_refs"):
-        return value.remap_operand_refs(mapping)
-    return value
-
-
-# --- Structure keys for common-subexpression elimination -------------------
-# `Op.structure_key()` returns a hashable value that is equal for two ops iff
-# they are the same computation. Sentinel keys carry a leading marker string so
-# they stay disjoint from real values.
-_ALL_SELECTOR_KEY = ("__all_selector__",)
-# A graph-fed estimator hyper-parameter: its binding is captured by an op's
-# `param_refs` plus the input ids, so the stale DataOp left in get_params() must
-# not block two otherwise-equal estimators from merging.
-_GRAPH_PARAM_KEY = ("__graph_param__",)
-
-
-def config_key(value):
-    """Turn a config-field value into a hashable, value-based key.
-
-    OperandRefs and hashable scalars are kept by value (so equal operands and
-    constants compare equal); containers are recursed into; estimators are keyed
-    by type and parameters; unhashable leaves (DataFrames, arrays, ...) fall back
-    to identity, which is conservative (distinct objects never compare equal).
-    """
-    if isinstance(value, OperandRef):
-        return value
-    if isinstance(value, All):
-        return _ALL_SELECTOR_KEY
-    if isinstance(value, BaseEstimator):
-        return estimator_key(value)
-    if isinstance(value, (list, tuple)):
-        return (type(value).__name__, tuple(config_key(v) for v in value))
-    if isinstance(value, dict):
-        return ("__dict__", frozenset((k, config_key(v)) for k, v in value.items()))
-    if isinstance(value, (set, frozenset)):
-        return ("__set__", frozenset(config_key(v) for v in value))
-    try:
-        hash(value)
-    except TypeError:
-        return ("__id__", id(value))
-    return value
-
-
-def estimator_key(est: BaseEstimator):
-    """Structure key for an estimator, consistent with parameter-wise equality.
-
-    Graph-fed parameters (still DataOps in ``get_params()``) are normalized to a
-    constant marker: their binding is represented by the op's ``param_refs`` field
-    and input ids, not by the estimator object itself.
-    """
-    items = []
-    for k, v in est.get_params().items():
-        items.append((k, _GRAPH_PARAM_KEY if isinstance(v, DataOp) else config_key(v)))
-    return ("__estimator__", type(est), frozenset(items))
-
-
-class Op():
-    def __init__(self, inputs=None,outputs=None, name=None, is_X=False, is_y=False):
-        self.name = name
-        self.outputs = outputs if outputs is not None else []
-        self.inputs = inputs if inputs is not None else []
-        self.is_X = is_X
-        self.is_y = is_y
-        self.output_type = OutputType.UNKNOWN
-        self.is_split_op = False
-        self.was_cloned = False
-        self.remove_after: list[Op] = []
-
-    def to_str_helper(self):
-        class_name = self.__class__.__name__
-        is_df = " [df]" if self.output_type is OutputType.FRAME else ""
-        name = f"({self.name})" if self.name and len(self.name) > 0 else ""
-        # truncate name if it is too long
-        if len(name) > 50:
-            name = name[:50] + "..."
-        return class_name, name, is_df
-
-    def __str__(self):
-        return "".join(self.to_str_helper())
-    
-    def __repr__(self):
-        class_name, name, is_df = self.to_str_helper()
-        return f"{class_name}{name}[cloned={self.was_cloned}, id={id(self)}{is_df}]"
-
-    def update_name(self):
-        pass
-
-    def has_outputs(self) -> bool:
-        return self.outputs is not None and len(self.outputs) > 0
 
     def is_choice(self) -> bool:
         return isinstance(self, ChoiceOp)
-
-    @property
-    def num_input_operands(self) -> int:
-        return len(self.inputs)
-
-    def _check_dup_in_inputs(self, input: Op) -> int | None:
-        """Return the input index if already present, otherwise None."""
-        for i, in_ in enumerate(self.inputs):
-            if in_ is input:
-                return i
-        return None
-
-    def _check_dup_in_outputs(self, output: Op) -> int | None:
-        """Return the output index if already present, otherwise None."""
-        for i, out_ in enumerate(self.outputs):
-            if out_ is output:
-                return i
-        return None
-
-    def add_output(self, output: Op) -> int:
-        """Add an output edge, de-duplicating. Returns the output index."""
-        idx = self._check_dup_in_outputs(output)
-        if idx is not None:
-            return idx
-        self.outputs.append(output)
-        return len(self.outputs) - 1
-
-    def add_input(self, input: Op) -> int:
-        """Add an input edge, de-duplicating. Returns the operand index of `input`."""
-        idx = self._check_dup_in_inputs(input)
-        if idx is not None:
-            return idx
-        self.inputs.append(input)
-        return len(self.inputs) - 1
-
-    def _dedupe_input_refs(self, old_ref, new_ref):
-        """Remove input slot old_ref and redirect its OperandRefs to new_ref.
-
-        ``old_ref`` is always the higher of the two slots (the duplicate we drop)
-        and ``new_ref`` the surviving lower slot. Refs pointing at old_ref are
-        redirected to new_ref; refs pointing after old_ref shift left by one. The
-        renumbering goes through the shared :func:`remap_operand_refs` walker so
-        refs buried in a ``ColumnExpr`` field (e.g. a SelectionOp predicate) are
-        remapped too, not just refs in plain tuples/lists/dicts.
-        """
-        n = len(self.inputs)
-        self.inputs.pop(old_ref)
-        mapping = {k: (new_ref if k == old_ref else k - 1 if k > old_ref else k)
-                   for k in range(n)}
-        for field in getattr(type(self), "fields", []):
-            value = getattr(self, field)
-            new_value = remap_operand_refs(value, mapping)
-            if new_value is not value:
-                setattr(self, field, new_value)
-
-    def consumes_inputs_positionally(self) -> bool:
-        """Whether this op addresses its inputs by position rather than OperandRef.
-
-        Such ops (ChoiceOp outcomes, ImplOp's cached ``operand_index``) must never
-        have two input slots collapsed into one by edge de-duplication -- their
-        slots are kept distinct instead. Shared with ``_op_cse._can_merge`` so the
-        two dedup paths treat the same op types as un-collapsible.
-        """
-        return False
-
-    def replace_input(self, old_input: Op, new_input: Op):
-        """Replace an input edge, deduplicating OperandRef-based inputs when needed.
-
-        If replacing old_input with new_input would create a duplicate input, keep
-        the leftmost slot and remap OperandRefs away from the removed slot. Ops that
-        consume inputs positionally keep the duplicate slot (a plain swap instead).
-        """
-        i = self._check_dup_in_inputs(old_input)
-        if i is None:
-            raise ValueError(f"Input {old_input} not found in {self.__class__.__name__}.")
-        idx = self._check_dup_in_inputs(new_input)
-        if idx is not None and idx != i and not self.consumes_inputs_positionally():
-            if idx < i:
-                self._dedupe_input_refs(old_ref=i, new_ref=idx)
-            else:
-                self.inputs[i] = new_input
-                self._dedupe_input_refs(old_ref=idx, new_ref=i)
-            return
-        self.inputs[i] = new_input
-
-    def replace_input_of_outputs(self, new_input):
-        for out in self.outputs:
-            out.replace_input(self, new_input)
-
-    def replace_output(self, old_output: Op, new_output: Op):
-        i = self._check_dup_in_outputs(old_output)
-        if i is None:
-            raise ValueError(f"Output {old_output} not found in {self.__class__.__name__}.")
-        self.outputs[i] = new_output
-
-    def replace_output_of_inputs(self, new_output):
-        for in_ in self.inputs:
-            in_.replace_output(self, new_output)
-
-    def clone(self):
-        if getattr(self.__class__, "fields", None) is None:
-            raise NotImplementedError(f"Cloning of {self.__class__.__name__} objects is not implemented yet. Please implement it.")
-        args, atts = self.__class__.fields, self.__dict__.items()
-        fields = {k: clone_value(v) for k,v in atts if k in args}
-        new_op = self.__class__(**fields)
-        new_op.was_cloned = True
-        return new_op
-
-    def process(self, mode: str, inputs: list):
-        raise NotImplementedError(f"Processing of {self.__class__.__name__} objects is not implemented yet. Please implement it.")
 
     def structure_key(self):
         """Hashable key for CSE: equal for two ops iff they are the same computation.
@@ -413,20 +123,6 @@ class Op():
         config = tuple((name, config_key(getattr(self, name))) for name in fields)
         return (type(self), input_ids, config)
 
-    def check_kwargs(self, kwargs):
-        if not isinstance(kwargs, dict):
-            raise TypeError(
-                f"The `{self}'s kwargs` should be a dict of named arguments. Got an object of type"
-                f" {type(kwargs).__name__!r} instead: {kwargs!r}"
-            )
-
-def clone_value(value):
-    if isinstance(value, dict):
-        return {k:clone_value(v) for k,v in value.items()}
-    elif isinstance(value, tuple):
-        return tuple(clone_value(el) for el in value)
-    else:
-        return value
 
 class ImplOp(Op):
     def __init__(self, name: str, skrub_impl):
@@ -524,7 +220,7 @@ class BaseEstimatorOp(Op):
     fields = ["estimator", "y", "cols", "how", "allow_reject", "unsupervised", "kwargs", "param_refs"]
 
     def __init__(self, estimator: BaseEstimator, y=None, cols=None, how="no-wrap", allow_reject=False, unsupervised=False, kwargs=None, param_refs=None):
-        super().__init__(name=estimator.__class__.__name__)
+        super().__init__()
         if kwargs is None:
             kwargs = {}
         self.check_kwargs(kwargs)
@@ -595,11 +291,14 @@ class BaseEstimatorOp(Op):
     def get_process_task(self):
         raise NotImplementedError(f"get_process_task must be implemented in {self.__class__.__name__}")
 
-class EstimatorOp(BaseEstimatorOp):
+class PredictorOp(BaseEstimatorOp):
+    logical_family = "Predictor"
+
     def get_process_task(self):
         return process_estimator_task
 
 class TransformerOp(BaseEstimatorOp):
+    logical_family = "Transformer"
     def get_process_task(self):
         return process_transformer_task
 
@@ -632,7 +331,7 @@ def check_estm_inputs(estimator, mode, x, y):
             estimator = estimator.transformer
     if input_is_polars and not estm_supports_polars(estimator):
         converted = True
-        logger.debug(f"Estimator {estimator.__class__.__name__} does not support Polars DataFrame. Converting to Pandas DataFrame.")
+        logger.debug(f"Predictor {estimator.__class__.__name__} does not support Polars DataFrame. Converting to Pandas DataFrame.")
         x = x.to_pandas()
         if y is not None and mode == "fit_transform":
             y = y.to_pandas()
@@ -653,7 +352,7 @@ def process_estimator_task(task_data):
         result = estimator.predict(x, **kwargs)
         return result, estimator
     else:
-        raise ValueError(f"Mode {mode} not supported for EstimatorOp.")
+        raise ValueError(f"Mode {mode} not supported for PredictorOp.")
 
 def process_transformer_task(task_data):
     """ Process a transformer (TransformerOp) task in a worker process. """
@@ -674,8 +373,9 @@ def process_transformer_task(task_data):
 
 
 class ChoiceOp(Op):
+    logical_family = "Choice"
     fields = ["outcome_names"]
-    
+
     def __init__(self, outcome_names: list[str] = None, n_outcomes: int = None, choice_name: str=None, append_choice_name = True, inputs: list = None):
         if inputs is None:
             inputs = []
@@ -800,14 +500,7 @@ class GetItemOp(Op):
         if name is None:
             name = str(key)
         super().__init__(name=name)
-
-
-    def process(self, mode: str, inputs: list):
-        # The container being indexed is the implicit primary operand (index 0).
-        key = inputs[self.key.k] if isinstance(self.key, OperandRef) else self.key
-        if self.is_filter and FLAGS.force_polars:
-            return inputs[0].filter(key)
-        return inputs[0][key]
+    # Execution lives in the physical impls (physical/_getitem_execs.py).
 
 class BinOp(Op):
     fields = ["op", "left", "right"]
@@ -865,7 +558,7 @@ def _apply_estimator_op(impl: Apply, estimator, ids_to_ops: dict) -> Op:
         # Same normalization skrub's _wrap_estimator applies at fit time; needed
         # here already because BaseEstimatorOp clones its estimator on construction.
         estimator = PassThrough()
-    estimator_class = EstimatorOp if hasattr(estimator, "predict") else TransformerOp
+    estimator_class = PredictorOp if hasattr(estimator, "predict") else TransformerOp
     binder = OperandBinder(ids_to_ops)
     binder.ref(impl.X)  # OperandRef(0)
     param_refs = {k: binder.ref(v) for k, v in estimator.get_params().items()
