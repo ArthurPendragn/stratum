@@ -15,7 +15,10 @@ import numpy as np
 @contextmanager
 def csv_file(df, **to_csv_kwargs):
     """Write `df` to a temp .csv file and yield its path; cleaned up on exit."""
-    tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w")
+    # newline="" prevents the text-mode handle from adding an extra "\r" to the
+    # "\r\n" that pandas' csv writer already emits (which would otherwise leave a
+    # stray "\r" on the last column of every line on Windows).
+    tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w", newline="")
     df.to_csv(tmp, index=False, **to_csv_kwargs)
     tmp.close()
     try:
