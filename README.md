@@ -78,7 +78,7 @@ def main():
     X = df_clean.drop(columns=["current_annual_salary"]).skb.mark_as_X()
 
     skrub.set_config(rust_backend=True, debug_timing=True, scheduler=True, stats=True)
-    tv = skrub.TableVectorizer(high_cardinality=skrub.StringEncoder(), low_cardinality=OneHotEncoder())
+    tv = skrub.TableVectorizer(high_cardinality=skrub.StringEncoder(), low_cardinality=OneHotEncoder(sparse_output=False))
     X_enc = X.skb.apply(tv)
     print(f"Encoded data shape: {X_enc.shape.skb.preview()}")
 
