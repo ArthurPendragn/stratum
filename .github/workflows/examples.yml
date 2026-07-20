@@ -1,0 +1,81 @@
+name: Examples
+
+on:
+  push:
+    paths:
+      - 'examples/**'
+      - 'stratum/**'
+      - '_rust/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/examples.yml'
+    branches: [main, master]
+  pull_request:
+    paths:
+      - 'examples/**'
+      - 'stratum/**'
+      - '_rust/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/examples.yml'
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  run-examples:
+    name: Run examples
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Cache Cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            _rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('_rust/Cargo.lock') }}
+
+      - name: Create virtual environment with uv
+        run: uv venv
+
+      - name: Install maturin
+        run: uv pip install maturin
+
+      - name: Build Rust extension
+        working-directory: _rust
+        run: |
+          source ../.venv/bin/activate
+          maturin develop --release
+
+      - name: Install project
+        run: uv sync
+
+      - name: Run examples
+        run: |
+          source .venv/bin/activate
+          status=0
+          for example in examples/*.py; do
+            echo "::group::$example"
+            if python "$example"; then
+              echo "PASS: $example"
+            else
+              echo "::error file=$example::Example failed: $example"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $status
