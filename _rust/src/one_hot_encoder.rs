@@ -130,7 +130,7 @@ pub fn ohe_transform_csr(
     let code_slices: Vec<&[i32]> = codes.iter().map(|a| a.as_slice().unwrap()).collect();
 
     // Heavy compute without GIL
-    let (data, indices, indptr, n_rows, n_cols) = py.allow_threads(|| {
+    let (data, indices, indptr, n_rows, n_cols) = py.detach(|| {
         compute_ohe_transform_csr(&code_slices, &n_cats, &drop_idx)
     });
 
@@ -190,7 +190,7 @@ pub fn csr_to_dense(py: Python<'_>, data: PyReadonlyArray1<f32>, indices: PyRead
     }
 
     // Heavy compute without GIL
-    let out = py.allow_threads(|| {
+    let out = py.detach(|| {
         compute_csr_to_dense(data, indices, indptr, n_rows, n_cols)
     });
 
