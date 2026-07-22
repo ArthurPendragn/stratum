@@ -25,5 +25,5 @@ ndarray-linalg = { version = "0.17.0", features = ["intel-mkl-static"] }
 rayon = "1.11.0"
 once_cell = "1.21.3"
 faer = { version = "0.23.2" }
-tar = "0.4.45"
+tar = "0.4.46"
 rustls-webpki = "0.103.13"
