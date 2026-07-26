@@ -37,7 +37,10 @@ pub fn start_timing() -> Option<Instant> {
 #[inline]
 pub fn print_timing(msg: &str, start: Option<Instant>) {
     match start {
-        Some(t0) => eprintln!("[rust] {msg}: {}ms", t0.elapsed().as_millis()),
+        Some(t0) => {
+            // Fractional ms so sub-millisecond stages (e.g. hv assemble_csr) are visible.
+            eprintln!("[rust] {msg}: {:.3}ms", t0.elapsed().as_secs_f64() * 1000.0);
+        }
         None => { /*do nothing*/ }
     }
 }
