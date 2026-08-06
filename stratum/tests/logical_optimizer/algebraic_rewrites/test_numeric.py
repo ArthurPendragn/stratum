@@ -779,6 +779,46 @@ class TestCSE(unittest.TestCase):
         num_sum = sum(1 for op in out if isinstance(op, NumericOp) and op.type == NumericOpType.SUM)
         self.assertGreaterEqual(num_sum, 1)
 
+    def test_no_rewrite_sum_with_axis(self):
+        """exp → sum(axis=0) → log must NOT match: _logsumexp ignores axis."""
+        df = st.as_data_op(np.array([[1.0, 2.0], [3.0, 4.0]]))
+        t1 = df.skb.apply_func(np.exp)
+        t2 = t1.skb.apply_func(np.sum, axis=0)
+        t3 = t2.skb.apply_func(np.log)
+
+        out, *_ = optimize(t3)
+        self.assertEqual(len(out), 4)
+        self.assertTrue(any(
+            isinstance(op, NumericOp) and op.type == NumericOpType.SUM for op in out
+        ))
+
+    def test_no_rewrite_sum_with_keepdims(self):
+        """Any reduction modifier blocks the match, not just axis."""
+        df = st.as_data_op(np.array([1.0, 2.0, 3.0]))
+        t1 = df.skb.apply_func(np.exp)
+        t2 = t1.skb.apply_func(np.sum, keepdims=True)
+        t3 = t2.skb.apply_func(np.log)
+
+        out, *_ = optimize(t3)
+        self.assertEqual(len(out), 4)
+
+    def test_log_sum_exp_is_numerically_stable(self):
+        """The whole point: the unstable form overflows, the rewrite does not."""
+        x = np.array([1000.0, 1000.0])
+        with np.errstate(over="ignore"):  # the overflow is the thing under test
+            self.assertTrue(np.isinf(np.log(np.sum(np.exp(x)))))
+
+            df = st.as_data_op(x)
+            t1 = df.skb.apply_func(np.exp)
+            t2 = t1.skb.apply_func(np.sum)
+            t3 = t2.skb.apply_func(np.log)
+
+            out, *_ = optimize(t3)
+        self.assertEqual(len(out), 2)
+        result = out[1].process("fit", [out[0].value])
+        self.assertTrue(np.isfinite(result))
+        np.testing.assert_almost_equal(result, 1000.0 + np.log(2.0))
+
 
 class TestPowByOne(unittest.TestCase):
     """`x ** 1 -> x`, matched on NumericOpType.POW.

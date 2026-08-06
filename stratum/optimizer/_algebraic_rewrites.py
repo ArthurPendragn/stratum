@@ -78,6 +78,8 @@ def algebraic_rewrites(root: Op, config: AlgebraicRewritesConfig) -> Op:
     if config.any_mul_zero:
         root = eliminate_any_mul_zero(root)
     if config.log_sum_exp:
+        # Stability, not speed -- see _logsumexp. Enabled by default because the
+        # unstable form silently overflows to inf.
         root = eliminate_log_sum_exp(root)
     log_time("algebraic_rewrite", start)
     return root

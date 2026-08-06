@@ -276,7 +276,15 @@ def make_replace_three_op_chain_root_safe(make_replacement):
 
 
 def _logsumexp(x):
-    """Numerically stable log(sum(exp(x)))."""
+    """Numerically stable log(sum(exp(x))): ``c + log(sum(exp(x - c)))``, ``c = max(x)``.
+
+    Note: this is a *stability* rewrite, not a speed one. There is no fused
+    kernel here -- the replacement still runs separate NumPy passes, and the
+    extra ``max`` / ``subtract`` make it marginally more work than the original
+    three-op chain. What it buys is that inputs large enough to overflow ``exp``
+    (e.g. ``x = 1000``) return a finite result instead of ``inf``. Collapsing
+    three IR nodes into one is a side effect, not the motivation.
+    """
     c = np.max(x)
     return c + np.log(np.sum(np.exp(x - c)))
 
@@ -296,6 +304,10 @@ def match_log_sum_exp(op):
     if op2.type is not NumericOpType.SUM:
         return None
     if len(op2.outputs) != 1:
+        return None
+    # `_logsumexp` always reduces over the whole array, so any reduction
+    # modifier (axis, keepdims, dtype, where, ...) would be silently dropped.
+    if op2.args or op2.kwargs:
         return None
 
     op3 = op2.outputs[0]
