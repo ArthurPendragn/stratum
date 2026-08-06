@@ -670,11 +670,9 @@ class TestCSE(unittest.TestCase):
 class TestPowByOne(unittest.TestCase):
     """`x ** 1 -> x`, matched on NumericOpType.POW.
 
-    An earlier version matched a raw `BinOp` with `operator.pow`, because POW was
-    not a NumericOpType yet. Once #135 added POW, `x ** 1` lowered to
-    `NumericOp(POW, constant=1)` and that matcher stopped firing; these tests pin
-    the current representation so a future IR change fails loudly instead of
-    silently disabling the rewrite.
+    The matcher depends on `x ** 1` lowering to `NumericOp(POW, constant=1)`, so
+    these tests pin that representation: a future IR change fails loudly instead
+    of silently disabling the rewrite.
     """
 
     def test_pow_by_one_eliminated(self):
@@ -754,14 +752,26 @@ class TestPowByOne(unittest.TestCase):
         self.assertEqual(len(out), 2)
         self.assertEqual(out[1].process("fit", [out[0].value]), 8)
 
-    def test_pow_by_one_root_safe(self):
-        """When x ** 1 is the root, the DAG must not break."""
-        value = st.as_data_op(7)
-        root = value ** 1
+    def test_pow_by_one_with_fanout(self):
+        """The eliminated POW may have several consumers; all must be rewired to x.
+
+        `test_pow_by_one_eliminated` already covers the root case, where the POW is
+        the last op; here it sits mid-DAG with two outputs.
+        """
+        value = st.as_data_op(5)
+        p = value ** 1
+        root = (p + 3) + (p * 2)
 
         out, *_ = optimize(root)
-        self.assertEqual(len(out), 1)
-        self.assertEqual(out[0].value, 7)
+
+        # ValueOp + add-3 + mul-2 + final add; the POW is gone and both branches
+        # read straight from the ValueOp.
+        self.assertEqual(len(out), 4)
+        self.assertEqual(out[1].inputs, [out[0]])
+        self.assertEqual(out[2].inputs, [out[0]])
+        left = out[1].process("fit", [out[0].value])
+        right = out[2].process("fit", [out[0].value])
+        self.assertEqual(out[3].process("fit", [left, right]), 18)
 
     def test_pow_by_one_disabled(self):
         """Disabling pow_by_one must leave x ** 1 untouched."""

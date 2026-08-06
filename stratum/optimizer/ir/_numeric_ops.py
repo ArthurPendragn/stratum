@@ -1,8 +1,10 @@
-from stratum.optimizer.ir._ops import BinOp, CallOp, Op, OperandRef
 import numbers
 import operator
-import numpy as np
 from enum import Enum
+
+import numpy as np
+
+from stratum.optimizer.ir._ops import BinOp, CallOp, Op, OperandRef
 
 class NumericOpType(Enum):
     GENERIC = "generic"
@@ -144,12 +146,11 @@ def make_binary_numeric_op(op: CallOp, type: NumericOpType) -> NumericOp:
 
 def extract_numeric_op(op: Op, root: Op) -> tuple[Op, bool]:
     new_op = None
-    # `isinstance` before `== 2`: an ndarray exponent (`df ** np.array([...])`) makes
-    # `op.right == 2` an elementwise array, which raises "truth value of an array is
-    # ambiguous" in this boolean context. Same trap the `_is_scalar_const` guard in
-    # _numeric_rewrites.py closes for the identity matchers.
-    if (isinstance(op, BinOp) and op.op is operator.pow
-            and isinstance(op.right, numbers.Real) and op.right == 2):
+    # Only `<placeholder> ** <scalar 2>` is a square. The `isinstance` guards must come
+    # before `== 2`: an ndarray exponent makes it an elementwise array, which raises
+    # "truth value of an array is ambiguous" in this boolean context.
+    if (isinstance(op, BinOp) and op.op is operator.pow and isinstance(op.left, OperandRef)
+        and isinstance(op.right, numbers.Real) and op.right == 2):
         new_op = NumericOp(func=np.square, args=(), kwargs={}, inputs=op.inputs, outputs=op.outputs)
     elif isinstance(op, BinOp) and op.op in _ARITH_OP_MAP:
         l_ph = isinstance(op.left, OperandRef)

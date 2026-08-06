@@ -13,10 +13,8 @@ def _is_scalar_const(value) -> bool:
     ambiguous" when used in a boolean context.
 
     ``numbers.Real`` rather than ``(int, float)`` so numpy scalars match too:
-    ``df ** np.int64(1)`` keeps its exponent as ``np.int64``, which is not an
-    ``int`` subclass and would otherwise skip every identity rewrite. (``np.float64``
-    *is* a ``float`` subclass, so only the integer types were affected.) ``Real``
-    still excludes ndarray and ``complex``, which is what the guard is for.
+    ``np.int64`` is not an ``int`` subclass and would otherwise skip every
+    identity rewrite. ``Real`` still excludes ndarray and ``complex``.
     """
     return isinstance(value, numbers.Real)
 
@@ -231,10 +229,13 @@ eliminate_pow_zero = rewrite_pass(
 )
 
 # `x ** 1 -> x`. Matched as a first-class identity on `NumericOpType.POW`, reusing the
-# same helper as `x * 1` / `x / 1`. An earlier version of this rewrite matched a raw
-# `BinOp` with `operator.pow` because POW was not yet a NumericOpType; once #135 added
-# it, `x ** 1` lowers to `NumericOp(POW, constant=1)` and the BinOp matcher stopped
-# firing. `reversed=False` keeps `1 ** x` (which is 1, not x) untouched.
+# same helper as `x * 1` / `x / 1`. `reversed=False` keeps `1 ** x` (which is 1, not x)
+# untouched.
+#
+# TODO(dtype): like `x / 1` below, not always dtype-preserving. `int_array ** 1.0`
+# yields float64, and under NEP 50 `int8_array ** np.int64(1)` yields int64, while
+# the eliminated result keeps the original dtype. Matching only a weak `int` 1 would
+# avoid this.
 eliminate_pow_by_one = rewrite_pass(
     match_identity_operation(NumericOp, NumericOpType.POW, 1, reversed=False),
     eliminate_single_op_chain_root_safe,
