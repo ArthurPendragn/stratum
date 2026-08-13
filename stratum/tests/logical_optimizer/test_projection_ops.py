@@ -64,9 +64,11 @@ class TestProjectionRewrites(unittest.TestCase):
         # The column getitem and both fused .dt accessors fold into the assign map.
         self.assertEqual(5, len(ops))
         map_op = next(o for o in ops if isinstance(o, AssignMapOp))
-        self.assertEqual({"year": DtExpr(Col("datetime"), "year"),
-                          "month": DtExpr(Col("datetime"), "month")},
-                         map_op.entries)
+        self.assertEqual(
+            ({"year": DtExpr(Col("datetime"), "year"),
+              "month": DtExpr(Col("datetime"), "month")},),
+            map_op.batches,
+        )
         self.assertIsInstance(ops[-1], MethodCallOp)  # the trailing .copy()
 
 

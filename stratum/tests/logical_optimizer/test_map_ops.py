@@ -42,8 +42,11 @@ class TestAssignMapFolding(unittest.TestCase):
         ops = optimize(out, OptConfig(dataframe_ops=True))
         map_op = _one(self, ops, AssignMapOp)
         day = DtExpr(DatetimeExpr(Col("c2")), "day")
-        self.assertEqual({"c3": BinOpExpr(operator.add, Col("c1"), Const(123)),
-                          "c4": day, "c5": day}, map_op.entries)
+        self.assertEqual(
+            ({"c3": BinOpExpr(operator.add, Col("c1"), Const(123)),
+              "c4": day, "c5": day},),
+            map_op.batches,
+        )
         # everything private to the assign is absorbed: only source + map remain
         self.assertEqual(1, len(map_op.inputs))
         for cls in (GetItemOp, BinOp, DatetimeConversionOp, GetAttrProjectionOp):
@@ -55,21 +58,24 @@ class TestAssignMapFolding(unittest.TestCase):
         date_col = src["c2"].skb.apply_func(pd.to_datetime)
         out = src.assign(c4=date_col.dt.day, c5=date_col.dt.day)
         map_op = _one(self, optimize(out, OptConfig(dataframe_ops=True)), AssignMapOp)
-        self.assertIs(map_op.entries["c4"].operand, map_op.entries["c5"].operand)
+        self.assertIs(
+            map_op.batches[0]["c4"].operand,
+            map_op.batches[0]["c5"].operand,
+        )
 
     def test_same_root_reused_across_entries(self):
         src = st.as_data_op(self.df)
         derived = src["c1"] + 1
         out = src.assign(first=derived, second=derived)
         map_op = _one(self, optimize(out, OptConfig(dataframe_ops=True)), AssignMapOp)
-        self.assertIs(map_op.entries["first"], map_op.entries["second"])
+        self.assertIs(map_op.batches[0]["first"], map_op.batches[0]["second"])
 
     def test_same_producer_used_for_both_operands(self):
         src = st.as_data_op(self.df)
         derived = src["c1"] + 1
         out = src.assign(total=derived + derived)
         map_op = _one(self, optimize(out, OptConfig(dataframe_ops=True)), AssignMapOp)
-        total = map_op.entries["total"]
+        total = map_op.batches[0]["total"]
         self.assertIsInstance(total, BinOpExpr)
         self.assertIs(total.left, total.right)
 
@@ -77,13 +83,16 @@ class TestAssignMapFolding(unittest.TestCase):
         src = st.as_data_op(self.df)
         out = src.assign(c=src["s"].str.count("1"))
         map_op = _one(self, optimize(out, OptConfig(dataframe_ops=True)), AssignMapOp)
-        self.assertEqual({"c": StrExpr(Col("s"), "count", ("1",))}, map_op.entries)
+        self.assertEqual(
+            ({"c": StrExpr(Col("s"), "count", ("1",))},),
+            map_op.batches,
+        )
 
     def test_scalar_constant_folds_to_const(self):
         src = st.as_data_op(self.df)
         out = src.assign(c3=src["c1"] + 1, flag=7)
         map_op = _one(self, optimize(out, OptConfig(dataframe_ops=True)), AssignMapOp)
-        self.assertEqual(Const(7), map_op.entries["flag"])
+        self.assertEqual(Const(7), map_op.batches[0]["flag"])
 
     def test_sequence_constant_falls_back_to_assign_op(self):
         # A list-valued kwarg means "assign these values"; backends spell that
@@ -107,7 +116,7 @@ class TestAssignMapFolding(unittest.TestCase):
         out = src[mask].assign(keep=mask)
         ops = optimize(out, OptConfig(dataframe_ops=True))
         map_op = _one(self, ops, AssignMapOp)
-        self.assertIsInstance(map_op.entries["keep"], OperandLeaf)
+        self.assertIsInstance(map_op.batches[0]["keep"], OperandLeaf)
         self.assertEqual(2, len(map_op.inputs))  # [selection frame, shared mask]
         self.assertTrue(any(isinstance(o, BinOp) for o in ops))
 
@@ -121,7 +130,7 @@ class TestAssignMapFolding(unittest.TestCase):
         out = src.assign(keep=scaled["c1"])
         ops = optimize(out, OptConfig(dataframe_ops=True))
         map_op = _one(self, ops, AssignMapOp)
-        self.assertIsInstance(map_op.entries["keep"], OperandLeaf)
+        self.assertIsInstance(map_op.batches[0]["keep"], OperandLeaf)
         self.assertEqual(2, len(map_op.inputs))  # [src, scaled["c1"]]
         self.assertTrue(any(isinstance(o, TransformerOp) for o in ops))
 
@@ -130,7 +139,7 @@ class TestAssignMapFolding(unittest.TestCase):
         parsed = src["c2"].skb.apply_func(pd.to_datetime, dayfirst=True)
         ops = optimize(src.assign(parsed=parsed), OptConfig(dataframe_ops=True))
         map_op = _one(self, ops, AssignMapOp)
-        self.assertIsInstance(map_op.entries["parsed"], OperandLeaf)
+        self.assertIsInstance(map_op.batches[0]["parsed"], OperandLeaf)
         _one(self, ops, DatetimeConversionOp)
 
 
@@ -141,11 +150,19 @@ class TestAssignMapProcess(unittest.TestCase):
         self.df = pd.DataFrame({"x": [1, 2, 3],
                                 "d": ["2020-01-01", "2020-02-03", "2020-03-05"]})
 
+    def test_constructor_stores_one_canonical_batch(self):
+        entries = {"y": Const(1)}
+
+        op = AssignMapOp(batches=(entries,))
+
+        self.assertEqual((entries,), op.batches)
+        self.assertFalse(hasattr(op, "entries"))
+
     def test_expr_entries_pandas(self):
-        op = AssignMapOp(entries={
+        op = AssignMapOp(batches=({
             "y": BinOpExpr(operator.add, Col("x"), Const(10)),
             "day": DtExpr(DatetimeExpr(Col("d")), "day"),
-            "flag": Const(1)})
+            "flag": Const(1)},))
         result = run_op(op, self.df)
         self.assertEqual([11, 12, 13], result["y"].tolist())
         self.assertEqual([1, 3, 5], result["day"].tolist())
@@ -154,15 +171,15 @@ class TestAssignMapProcess(unittest.TestCase):
 
     def test_datetime_expr_forwards_pandas_kwargs(self):
         frame = pd.DataFrame({"d": ["01/02/2020"]})
-        op = AssignMapOp(entries={
-            "parsed": DatetimeExpr(Col("d"), kwargs={"dayfirst": True})})
+        op = AssignMapOp(batches=({
+            "parsed": DatetimeExpr(Col("d"), kwargs={"dayfirst": True})},))
         result = run_op(op, frame)
         self.assertEqual(pd.Timestamp("2020-02-01"), result["parsed"].iloc[0])
 
     def test_expr_entries_polars(self):
-        op = AssignMapOp(entries={
+        op = AssignMapOp(batches=({
             "y": BinOpExpr(operator.add, Col("x"), Const(10)),
-            "day": DtExpr(DatetimeExpr(Col("d")), "day")})
+            "day": DtExpr(DatetimeExpr(Col("d")), "day")},))
         with force_polars():
             result = run_op(op, pl.from_pandas(self.df))
         self.assertEqual([11, 12, 13], result["y"].to_list())
@@ -171,41 +188,44 @@ class TestAssignMapProcess(unittest.TestCase):
     def test_is_month_end_entry_polars(self):
         frame = pl.DataFrame({
             "d": pl.Series("d", pd.to_datetime(["2025-01-31", "2025-01-15"]))})
-        op = AssignMapOp(entries={"end": DtExpr(Col("d"), "is_month_end")})
+        op = AssignMapOp(batches=({
+            "end": DtExpr(Col("d"), "is_month_end")},))
         with force_polars():
             result = run_op(op, frame)
         self.assertEqual([True, False], result["end"].to_list())
 
     def test_operand_leaf_entry(self):
-        op = AssignMapOp(entries={"ext": OperandLeaf(OperandRef(1))})
+        op = AssignMapOp(batches=({"ext": OperandLeaf(OperandRef(1))},))
         result = run_op(op, self.df, pd.Series([7, 8, 9]))
         self.assertEqual([7, 8, 9], result["ext"].tolist())
 
     def test_pandas_leaf_converts_under_polars(self):
         # A leaf feeding pandas data into a polars plan is converted, mirroring
         # the AssignOp behaviour.
-        op = AssignMapOp(entries={"ext": OperandLeaf(OperandRef(1))})
+        op = AssignMapOp(batches=({"ext": OperandLeaf(OperandRef(1))},))
         with force_polars():
             result = run_op(op, pl.from_pandas(self.df), pd.Series([7, 8, 9]))
         self.assertEqual([7, 8, 9], result["ext"].to_list())
 
     def test_scalar_leaf_broadcasts_under_polars(self):
-        op = AssignMapOp(entries={"ext": OperandLeaf(OperandRef(1))})
+        op = AssignMapOp(batches=({"ext": OperandLeaf(OperandRef(1))},))
         with force_polars():
             result = run_op(op, pl.from_pandas(self.df), 7)
         self.assertEqual([7, 7, 7], result["ext"].to_list())
 
     def test_list_leaf_becomes_column_under_polars(self):
-        op = AssignMapOp(entries={"ext": OperandLeaf(OperandRef(1))})
+        op = AssignMapOp(batches=({"ext": OperandLeaf(OperandRef(1))},))
         with force_polars():
             result = run_op(op, pl.from_pandas(self.df), [7, 8, 9])
         self.assertEqual([7, 8, 9], result["ext"].to_list())
 
-    def test_clone_shares_immutable_entries(self):
-        op = AssignMapOp(entries={"y": BinOpExpr(operator.add, Col("x"), Const(1))})
+    def test_clone_copies_batches_and_shares_immutable_expressions(self):
+        op = AssignMapOp(batches=({
+            "y": BinOpExpr(operator.add, Col("x"), Const(1))},))
         cloned = op.clone()
-        self.assertIsNot(op.entries, cloned.entries)
-        self.assertIs(op.entries["y"], cloned.entries["y"])
+        self.assertIsNot(op.batches, cloned.batches)
+        self.assertIsNot(op.batches[0], cloned.batches[0])
+        self.assertIs(op.batches[0]["y"], cloned.batches[0]["y"])
 
 
 class TestMapStructureKey(unittest.TestCase):
@@ -214,14 +234,22 @@ class TestMapStructureKey(unittest.TestCase):
     def test_assign_map_equal_keys(self):
         src = Op()
         entries = {"y": BinOpExpr(operator.add, Col("x"), Const(1))}
-        a = AssignMapOp(entries=dict(entries), inputs=[src])
-        b = AssignMapOp(entries=dict(entries), inputs=[src])
+        a = AssignMapOp(batches=(dict(entries),), inputs=[src])
+        b = AssignMapOp(batches=(dict(entries),), inputs=[src])
         self.assertEqual(a.structure_key(), b.structure_key())
 
-    def test_assign_map_differs_on_entries(self):
+    def test_assign_map_differs_on_batches(self):
         src = Op()
-        a = AssignMapOp(entries={"y": Const(1)}, inputs=[src])
-        b = AssignMapOp(entries={"y": Const(2)}, inputs=[src])
+        a = AssignMapOp(batches=({"y": Const(1)},), inputs=[src])
+        b = AssignMapOp(batches=({"y": Const(2)},), inputs=[src])
+        self.assertNotEqual(a.structure_key(), b.structure_key())
+
+    def test_assign_map_differs_on_assignment_order(self):
+        src = Op()
+        a = AssignMapOp(
+            batches=({"y": Const(1), "z": Const(2)},), inputs=[src])
+        b = AssignMapOp(
+            batches=({"z": Const(2), "y": Const(1)},), inputs=[src])
         self.assertNotEqual(a.structure_key(), b.structure_key())
 
     def test_duplicate_assign_maps_dedup_after_cse(self):
@@ -231,6 +259,20 @@ class TestMapStructureKey(unittest.TestCase):
             [data.assign(y=data["x"] + 1)], axis=0)
         ops = optimize(root, OptConfig(dataframe_ops=True))
         self.assertEqual(1, len([o for o in ops if isinstance(o, AssignMapOp)]))
+
+    def test_cse_preserves_assignment_column_order(self):
+        df = pd.DataFrame({"x": [1, 2]})
+        data = st.as_data_op(df)
+        first = data.assign(y=data["x"] + 1, z=data["x"] + 2)
+        second = data.assign(z=data["x"] + 2, y=data["x"] + 1)
+        root = first.skb.concat([second], axis=1)
+
+        ops = optimize(root, OptConfig(dataframe_ops=True))
+        self.assertEqual(2, len([o for o in ops if isinstance(o, AssignMapOp)]))
+        self.assertEqual(
+            ["x", "y", "z", "x", "z", "y"],
+            list(st._api.evaluate(root).columns),
+        )
 
 
 class TestMapExprRefContract(unittest.TestCase):
@@ -323,16 +365,15 @@ def test_assign_pipeline_evaluates(polars):
 
 def test_chained_assign_maps_evaluate(polars):
     # Three chained assigns, each reading a column produced by the previous one:
-    # every assign folds into its own map, and Col refs resolve against the
-    # previous map's output frame.
+    # map fusion preserves those references in ordered materialization batches.
     df = pd.DataFrame({"x": [1, 2, 3]})
     src = st.as_data_op(df)
     d1 = src.assign(x2=src["x"] * 2)
     d2 = d1.assign(x4=d1["x2"] * 2)
     d3 = d2.assign(x8=d2["x4"] * 2)
     ops = optimize(d3, OptConfig(dataframe_ops=True))
-    assert 3 == len([o for o in ops if isinstance(o, AssignMapOp)])
-    assert 4 == len(ops)  # source + three maps
+    assert 1 == len([o for o in ops if isinstance(o, AssignMapOp)])
+    assert 2 == len(ops)  # source + one fused map
     result = st._api.evaluate(d3)
     assert [2, 4, 6] == list(result["x2"])
     assert [4, 8, 12] == list(result["x4"])

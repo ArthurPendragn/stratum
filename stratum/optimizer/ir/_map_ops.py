@@ -3,12 +3,13 @@
 A MapOp computes new columns of one source frame from backend-agnostic
 :class:`~stratum.optimizer.ir._column_expr.ColumnExpr` trees. The grammar is
 restricted to natively-lazy computations (arithmetic, boolean logic,
-``.str``/``.dt`` accessors, datetime parsing); on polars all entries compile
-into one ``with_columns`` kernel. Anything outside the grammar stays in the
-graph and feeds the map through an ``OperandLeaf`` input.
+``.str``/``.dt`` accessors, datetime parsing). Anything outside the grammar
+stays in the graph and feeds the map through an ``OperandLeaf`` input.
 
-:class:`AssignMapOp` -- from ``df.assign(...)`` -- is the only map kind so far:
-named, series-valued entries, with input columns passing through.
+:class:`AssignMapOp` -- from ``df.assign(...)`` -- is the only map kind so far.
+It stores one or more ordered assignment batches. Expressions within a batch
+observe the same input frame, while later batches observe columns materialized
+by earlier batches.
 """
 from __future__ import annotations
 
@@ -17,7 +18,8 @@ import polars as pl
 
 from stratum.optimizer.ir._column_expr import (ColumnExpr, Const, EvalContext,
                                                _Folder)
-from stratum.optimizer.ir._ops import (MethodCallOp, Op, OperandRef, OutputType)
+from stratum.optimizer.ir._ops import (
+    MethodCallOp, Op, OperandRef, OutputType, config_key)
 
 
 class MapOp(Op):
@@ -33,19 +35,39 @@ class MapOp(Op):
 
 
 class AssignMapOp(MapOp):
-    """``df.assign(...)`` with each assigned column folded to a ``ColumnExpr``.
+    """One or more sequential ``df.assign(...)`` operations.
 
-    ``entries`` maps a new column name to its series-valued expression; input
-    columns pass through unchanged.
+    Each item in ``batches`` maps column names to expressions evaluated
+    simultaneously against the frame at the start of that batch. Batches are
+    evaluated in order, preserving the materialization boundary between
+    originally distinct assignments while allowing them to share one DAG node.
     """
-    fields = ["entries"]
+    fields = ["batches"]
 
-    def __init__(self, entries: dict[str, ColumnExpr],
+    def __init__(self, batches: tuple[dict[str, ColumnExpr], ...],
                  inputs: list[Op] = None, outputs: list[Op] = None):
-        super().__init__(name=f"assign: {', '.join(entries)}",
+        if not batches or any(not batch for batch in batches):
+            raise ValueError("AssignMapOp requires at least one non-empty batch.")
+        batches = tuple(dict(batch) for batch in batches)
+        columns = (name for batch in batches for name in batch)
+        super().__init__(name=f"assign: {', '.join(columns)}",
                          inputs=inputs, outputs=outputs)
-        self.entries = entries
+        self.batches = batches
 
+    def structure_key(self):
+        """Return a CSE key that preserves assignment order within each batch.
+
+        The generic :meth:`Op.structure_key` deliberately treats dictionaries
+        as unordered configuration mappings.  Assignment dictionaries are
+        different: their insertion order determines the resulting frame's
+        column order, so maps with differently ordered entries must not merge.
+        """
+        input_ids = tuple(id(inp) for inp in self.inputs)
+        ordered_batches = tuple(
+            tuple(batch.items()) for batch in self.batches
+        )
+        config = (("batches", config_key(ordered_batches)),)
+        return (type(self), input_ids, config)
 
 # --- Folding: assign subgraphs -> MapOp ---------------------------------------
 
@@ -109,7 +131,10 @@ def make_assign_map_op(op: MethodCallOp) -> AssignMapOp | None:
                       else exprs[ref_names.index(name)])
                for name in kwargs}
 
-    new_op = AssignMapOp(entries=entries,
-                         inputs=[src, *folder.leaf_ops], outputs=list(op.outputs))
+    new_op = AssignMapOp(
+        batches=(entries,),
+        inputs=[src, *folder.leaf_ops],
+        outputs=list(op.outputs),
+    )
     _detach_absorbed_and_rewire(op, new_op, folder)
     return new_op

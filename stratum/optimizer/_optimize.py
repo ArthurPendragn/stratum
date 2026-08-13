@@ -9,6 +9,7 @@ from .ir._ops import ChoiceOp, Op, SearchEvalOp, as_op
 from ._op_utils import clone_sub_dag, find_choice_naive, replace_op_in_outputs, show_graph, topological_iterator, validate_dag
 from ._explain import explain_linear_plan
 from ._algebraic_rewrites import algebraic_rewrites, AlgebraicRewritesConfig
+from ._map_rewrites import fuse_assign_maps
 from ._linearization import linearize_dag
 from ._input_removal_planning import compute_pinned_ops, plan_input_removals
 from .physical._plan_context import PlanContext
@@ -56,11 +57,13 @@ class OptConfig():
         numeric_ops: bool = True,
         algebraic_rewrites: bool = True,
         algebraic_rewrite_config: AlgebraicRewritesConfig | None = None,
+        fuse_assign_maps: bool = True,
     ):
         self.cse = cse
         self.dataframe_ops = dataframe_ops
         self.unroll_choices = unroll_choices
         self.numeric_ops = numeric_ops
+        self.fuse_assign_maps = fuse_assign_maps
         self.algebraic_rewrites = algebraic_rewrites
         if algebraic_rewrite_config is None:
             algebraic_rewrite_config = AlgebraicRewritesConfig()
@@ -93,7 +96,8 @@ def _debug_validate_dag(root: Op):
     if FLAGS.validate_dag:
         validate_dag(root)
 
-def optimize(dag_root: DataOp, config: OptConfig = None, env: dict = None):
+def optimize(dag_root: DataOp, config: OptConfig = None, env: dict = None, *,
+             selector: ImplementationSelector | None = None):
     """Entry point for the optimizer. Runs the three planning phases and returns
     the linearized physical plan ``(linearized_dag, split_pos, flagged_ops)``.
 
@@ -101,14 +105,16 @@ def optimize(dag_root: DataOp, config: OptConfig = None, env: dict = None):
 
     1. :func:`logical_optimize` -- compile the Skrub DataOp DAG to the logical
        IR and run all backend-agnostic rewrites (extraction, CSE, choice
-       unrolling, algebraic rewrites).
+       unrolling, map fusion, algebraic rewrites).
     2. :func:`~stratum.optimizer.physical._lowering.lower_to_physical` -- lower
        logical ops to physical ops (one logical op may become several).
     3. :func:`physical_optimize` -- select a concrete implementation per
        physical op, then linearize and plan intermediate last use as the final step.
 
     ``env`` (variable name -> value), when supplied, lets the converter resolve
-    variables to compile-time constants (ValueOps) instead of VariableOps."""
+    variables to compile-time constants (ValueOps) instead of VariableOps.
+    ``selector`` may inject an implementation-selection strategy for this plan;
+    when omitted, the strategy configured in :class:`PlanContext` is used."""
     start = start_time()
     if config is None:
         config = OptConfig()
@@ -129,7 +135,7 @@ def optimize(dag_root: DataOp, config: OptConfig = None, env: dict = None):
 
     # Step 3: physical optimization (implementation selection + linearization).
     # TODO: May need physical-level rewrites before or after operator selection
-    result = physical_optimize(root, ctx)
+    result = physical_optimize(root, ctx, selector=selector)
 
     log_time("Optimization took in total", start)
     return result
@@ -162,6 +168,10 @@ def logical_optimize(dag_root: DataOp, config: OptConfig, env: dict = None) -> O
     # Unrolling of choices to a dag with only a single ChoiceOp at the end
     if config.unroll_choices:
         root = choice_unrolling(root)
+
+    if config.fuse_assign_maps:
+        root = fuse_assign_maps(root)
+        _debug_show_graph(root, "map_fusion")
 
     # Final logical DAG
     if config.algebraic_rewrites:
