@@ -47,7 +47,19 @@ class AlgebraicRewritesConfig:
 
 
 def algebraic_rewrites(root: Op, config: AlgebraicRewritesConfig) -> Op:
-    """Run all enabled algebraic rewrites, one pass per rewrite."""
+    """Run all enabled algebraic rewrites, one pass per rewrite.
+
+    Each rewrite runs exactly once, so a rewrite that *produces* a pattern another
+    rewrite *consumes* only fires if it is ordered first. `self_multiply` is placed
+    before `sqrt_square` for that reason: it turns `sqrt(x * x)` into
+    `sqrt(square(x))`, which `sqrt_square` then folds to `abs(x)`.
+
+    A single order cannot satisfy every such dependency (the enables-relation over
+    the rewrites has cycles), so some reducible graphs survive -- e.g. `(x - 0) * x`
+    stays a multiply because `identity_subtract` runs after `self_multiply`. See
+    #188 for running the whole set in a bounded loop, which removes the dependency
+    on ordering altogether.
+    """
     start = start_time()
     if config.identity_op:
         root = eliminate_identity_operation(root)
