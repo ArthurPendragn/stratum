@@ -1,28 +1,14 @@
 from __future__ import annotations
 from time import perf_counter
-from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import train_test_split, check_cv
-from sklearn.metrics._scorer import _Scorer, get_scorer
+from stratum.optimizer.ir._candidate_ops import ScoreCandidatesOp
 from stratum.optimizer.ir._dataframe_ops import SplitOp
-from stratum.optimizer.ir._ops import Op
+from stratum.optimizer.ir._ops import FITTING_MODE, Op
 from stratum.runtime._buffer_pool import BufferPool
 import polars as pl
 
 import logging
 logger = logging.getLogger(__name__)
-
-def get_scoring_func(scoring):
-    """Get scoring function from str or _Scorer object."""
-    if type(scoring) == str:
-        scoring = get_scorer(scoring)
-    if type(scoring) == _Scorer:
-        logger.info(f"Using scorer: {scoring}")
-        greater_is_better = scoring._sign > 0
-        scoring_func = scoring._score_func
-    else:
-        greater_is_better = False
-        scoring_func = mean_squared_error
-    return scoring_func, greater_is_better
 
 
 class Scheduler:
@@ -64,28 +50,40 @@ class Scheduler:
         split_op.indices = train_index
         self.compute(self.pos_split_op)
         split_op.indices = test_index
-        pred = self.compute(self.pos_split_op, mode="predict")
-        return pred["vals"][0]
+        rows = self.compute(self.pos_split_op, mode="predict")
+        return self._format_predict_result(rows)["vals"][0]
 
-    def grid_search(self, cv=None, scoring=None, return_predictions=False):
-        """Perform grid search with cross-validation on the logical DAG."""
+    def grid_search(self, cv=None):
+        """Perform grid search with cross-validation on the plan."""
         cv = check_cv(cv)
-
         logger.debug("\n" + "="*100 + "\n" + "Starting grid search" + "\n" + "="*100 + "\n")
+        # Before the sink: a plan with no X/y has no candidate set either, and the
+        # missing marks are the more useful thing to report.
         split_op = self.compute_xy()
+        sink = self.linearized_dag[-1]
+        if not isinstance(sink, ScoreCandidatesOp):
+            raise RuntimeError(
+                "this plan was not built for a search: it ends in"
+                f" {type(sink).__name__}, not ScoreCandidates. Build it with"
+                " `optimize(..., search=SearchConfig(...))`."
+            )
 
         results, predictions = [], []
 
         logger.debug("\n" + "="*100 + "\n" + "XY computed" + "\n" + "="*100 + "\n")
-        results = self.cross_validate(split_op, cv, scoring, predictions, results, return_predictions)
+        results = self.cross_validate(split_op, cv, predictions, results,
+                                      sink.emit_predictions, sink.response_mode)
         self.results_ = results
         self._finish()
-        return predictions if return_predictions else None
+        return predictions if sink.emit_predictions else None
 
-    def cross_validate(self, split_op, cv, scoring, predictions: list, results: list, return_predictions: bool):
-        """Perform cross-validation on the logical DAG."""
-        scoring_func, greater_is_better = get_scoring_func(scoring)
+    def cross_validate(self, split_op, cv, predictions: list, results: list,
+                       return_predictions: bool, response_mode: str = "predict"):
+        """Perform cross-validation on the plan, one scored row per candidate per fold.
 
+        ``response_mode`` is the estimator method the test-fold pass calls, which the
+        scorer chose at plan time (see `ScoreCandidatesOp`).
+        """
         # The split op's inputs are [X, y] (see add_splitting_op). Both are still
         # in the pool after compute_xy and are pinned by removal planning, so the
         # labels can be handed to the splitter: stratified splitters need them,
@@ -114,19 +112,18 @@ class Scheduler:
             logger.debug("\n" + "="*100 + "\n" + "Training done for fold " + str(i+1) + "\n" + "="*100 + "\n")
 
             split_op.indices = self.pool.pin(test_ids_handle)
-            df, y_test = self.compute(self.pos_split_op, mode="predict")
+            fold = self.compute(self.pos_split_op, mode=response_mode)
             self.pool.unpin(test_ids_handle)
             self.pool.remove(test_ids_handle)
             logger.debug("\n" + "="*100 + "\n" + "Predicting done for fold " + str(i+1) + "\n" + "="*100 + "\n")
             if return_predictions:
-                predictions.append(df)
-
-            df = df.with_columns(df["vals"].map_elements(lambda pred: scoring_func(y_test, pl.Series(pred))).alias("scores"))
-            df = df.drop("vals")
-            results.append(df)
+                predictions.append(fold.select("id", "vals"))
+            results.append(fold.select("id", "scores"))
 
         results = pl.concat(results)
-        results = results.group_by("id").mean().sort("scores", descending=greater_is_better)
+        # A scorer returns a utility whatever its metric -- a `neg_*` scorer carries the
+        # sign that makes it one -- so the best candidate is always the highest score.
+        results = results.group_by("id").mean().sort("scores", descending=True)
         return results
 
     def log_memory_usage(self):
@@ -134,6 +131,13 @@ class Scheduler:
 
     def process_op(self, op: Op):
         """Process a single DataOp node and return its output."""
+        if self.mode == FITTING_MODE and op.dead_in_fit:
+            # Nothing this pass runs reads its output, so it is not pinned, run or
+            # stored. Its removals still happen: it is the last consumer of those
+            # buffers, and skipping it is the only reason no one else drops them.
+            for in_op in op.remove_after:
+                self.pool.remove(in_op)
+            return op
         logger.debug(f"[{perf_counter() - self.t0:.2f}s] Processing op: {op}")
 
         try:
@@ -173,14 +177,9 @@ class Scheduler:
 
         return op
 
-    def _format_predict_result(self, pred):
-        """Helper method to format prediction results consistently."""
-        if isinstance(pred, list):
-            return pl.DataFrame(pred)
-        elif isinstance(pred, dict) and "id" in pred and "vals" in pred:
-            return pl.DataFrame([pred])
-        else:
-            return pl.DataFrame({"vals": [pred], "id": ["default"]})
+    def _format_predict_result(self, rows):
+        """The candidate-set sink's labelled rows as a frame."""
+        return pl.DataFrame(rows)
 
 
 class SequentialScheduler(Scheduler):
@@ -208,28 +207,23 @@ class SequentialScheduler(Scheduler):
         split_op.indices = train_index
         self.compute(self.pos_split_op)
         split_op.indices = test_index
-        pred, _ = self.compute(self.pos_split_op, mode="predict")
+        rows = self.compute(self.pos_split_op, mode="predict")
         self._finish()
-        return pred["vals"][0]
+        return self._format_predict_result(rows)["vals"][0]
 
     def compute(self, start_pos: int, mode="fit_transform"):
-        """Compute the pipeline from start_pos onwards with given inputs."""
+        """Compute the plan from start_pos onwards; outside the fitting pass, return its sink."""
         ops_to_compute = self.linearized_dag[start_pos:]
         if len(self.recompute_ops) != 0:
             ops_to_compute = self.recompute_ops + ops_to_compute
         self.mode = mode
 
-        y_true = None
         for node in ops_to_compute:
             self.process_op(node)
-            if mode == "predict" and isinstance(node, SplitOp):
-                y_true = self.pool.pin(node)[1]
 
-        out = None
-        if mode == "predict":
-            pred = self.pool.pin(self.linearized_dag[-1])
-            out = self._format_predict_result(pred), y_true
-        self.pool.remove(self.linearized_dag[-1])
+        sink = self.linearized_dag[-1]
+        out = self.pool.pin(sink) if mode != "fit_transform" else None
+        self.pool.remove(sink)
         self.log_memory_usage()
         return out
 

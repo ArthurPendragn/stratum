@@ -8,14 +8,25 @@ from skrub._data_ops._evaluation import needs_eval
 from sklearn.model_selection import check_cv
 
 from stratum._config import FLAGS
-from stratum.optimizer._optimize import optimize
+from stratum.optimizer._optimize import SearchConfig, optimize
+from stratum.optimizer.ir._scoring import resolve_scoring
 from stratum.runtime._scheduler import SequentialScheduler
 from stratum.utils._skrub_graph import find_x_impl, get_data
 from time import perf_counter
 
 #TODO: Rename this file
 def grid_search(dag: DataOp, cv=None, scoring=None, return_predictions=False, env=None):
-    """Perform grid search with cross-validation on a DataOp DAG."""
+    """Perform grid search with cross-validation on a DataOp DAG. ``scoring`` is required."""
+    if scoring is None:
+        # A search ranks a set, so every candidate has to be measured the same way.
+        # `.skb.make_grid_search()` still honours scoring=None, by handing the call to
+        # skrub. See docs/adr/0004-a-search-always-names-its-metric.md.
+        raise ValueError(
+            "grid_search requires scoring=. Without it each candidate would be scored by"
+            " its own estimator's `score`, so a batch mixing estimator kinds would rank"
+            " an accuracy against an R². Pass a string naming an sklearn metric, a scorer"
+            " built with `make_scorer`, or a callable `scorer(estimator, X, y)`."
+        )
     t0 = perf_counter()
     #FIXME: Measure operator execution only if stats is enabled
     env_extra = env if env else {}
@@ -23,12 +34,16 @@ def grid_search(dag: DataOp, cv=None, scoring=None, return_predictions=False, en
     for k, v in env_extra.items():
         env[k] = v
     cv = _resolve_cv(dag, cv, env)
+    # The scorer is plan-time state: it decides what the plan's last operator computes,
+    # and an unusable `scoring=` fails here rather than after a fold has been fitted.
+    search = SearchConfig(metric=resolve_scoring(scoring),
+                          return_predictions=return_predictions)
     # Resolve variables to constants at compile time, so the scheduler runs
     # without an environment.
-    linearized_dag, split_pos, flagged_ops = optimize(dag, env=env)
+    linearized_dag, split_pos, flagged_ops = optimize(dag, env=env, search=search)
     sched = SequentialScheduler(linearized_dag, split_pos, flagged_ops, FLAGS.stats, t0=t0)
 
-    preds = sched.grid_search(cv, scoring, return_predictions)
+    preds = sched.grid_search(cv)
 
     stats_printer(sched)
 

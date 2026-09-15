@@ -12,7 +12,7 @@ from skrub._data_ops._data_ops import DataOp
 
 from stratum.optimizer.ir._ops import (
     OperandRef, OperandBinder, OutputType, BinOp, CallOp, ChoiceOp, DummyConfigManager,
-    GetAttrOp, GetItemOp, ImplOp, MethodCallOp, Op, SearchEvalOp, ValueOp,
+    GetAttrOp, GetItemOp, ImplOp, MethodCallOp, Op, ValueOp,
     VariableOp, check_estm_inputs, estimator_parallel_config,
     estm_supports_polars, process_estimator_task, process_transformer_task,
     remap_operand_refs,
@@ -39,10 +39,6 @@ class TestOpCloning(unittest.TestCase):
     def test_op_clone_value_op(self):
         with self.assertRaises(ValueError):
             ValueOp(1).clone()
-
-    def test_op_clone_search_eval_op(self):
-        with self.assertRaises(ValueError):
-            SearchEvalOp([]).clone()
 
     def test_clone_ops(self):
         data = st.as_data_op(self.df)

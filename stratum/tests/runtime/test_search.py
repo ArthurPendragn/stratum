@@ -59,7 +59,7 @@ class SearchTest(RuntimeTest):
         search_stratum, preds = st._api.grid_search(y, cv=cv, scoring="neg_mean_squared_error", return_predictions=True)
 
         search = y.skb.make_grid_search(cv=cv, fitted=True,scoring="neg_mean_squared_error")
-        assert(np.allclose(search.results_["mean_test_score"]*-1, search_stratum.results_["scores"]))
+        assert(np.allclose(search.results_["mean_test_score"], search_stratum.results_["scores"]))
 
 
 
@@ -69,7 +69,7 @@ class SearchTest(RuntimeTest):
 
         try:
             with st.config(stats=True):
-                st._api.grid_search(end, return_predictions=True)
+                st._api.grid_search(end, scoring="neg_mean_squared_error", return_predictions=True)
             self.fail("Expected RuntimeError")
         except RuntimeError as e:
             self.assertEqual("X and y nodes not found in the DAG",str(e))
@@ -80,7 +80,7 @@ class SearchTest(RuntimeTest):
 
         try:
             with st.config(stats=True):
-                st._api.grid_search(end, return_predictions=True)
+                st._api.grid_search(end, scoring="neg_mean_squared_error", return_predictions=True)
             self.fail("Expected RuntimeError")
         except RuntimeError as e:
             self.assertEqual("X and y nodes not found in the DAG",str(e))
@@ -92,7 +92,7 @@ class SearchTest(RuntimeTest):
         y = data["y"].skb.mark_as_y()
         X = X + st.choose_from([0,1]).as_data_op()
         pred = X.skb.apply(DummyRegressor(), y=y)
-        st._api.grid_search(pred)
+        st._api.grid_search(pred, scoring="neg_mean_squared_error")
 
     def test_search_choice_not_at_the_end2(self):
         data = st.as_data_op(self.df)
@@ -103,7 +103,7 @@ class SearchTest(RuntimeTest):
         X = 4 + st.choose_from([X1,X2]).as_data_op()
         pred = X.skb.apply(DummyRegressor(), y=y)
         with config(scheduler=True):
-            pred.skb.make_grid_search()
+            pred.skb.make_grid_search(scoring="neg_mean_squared_error")
 
     def test_search_choice_not_at_the_end3(self):
         data = st.as_data_op(self.df)
@@ -113,7 +113,9 @@ class SearchTest(RuntimeTest):
         X2 = X.assign(x_b = X["x"] - 1)
         X = 4 + st.choose_from([X1,X2]).as_data_op()
         pred = X.skb.apply(InputCheckEstimator(), y=y)
-        st._api.grid_search(pred)
+        # InputCheckEstimator has no `score`, so (as under skrub) the metric has to be
+        # named: `scoring=None` would have nothing to fall back on.
+        st._api.grid_search(pred, scoring="neg_mean_squared_error")
 
     def test_search_error_during_dataop_processing(self):
         data = st.as_data_op(self.df)
@@ -122,7 +124,7 @@ class SearchTest(RuntimeTest):
         y = y.skb.apply_func(lambda a, m: (a, print(m))[0] if m != 'predict' else int("grr"), st.eval_mode())
         pred = X.skb.apply(DummyRegressor(), y=y)
         try:
-            st._api.grid_search(pred)
+            st._api.grid_search(pred, scoring="neg_mean_squared_error")
             self.fail("Expected RunTimeError")
         except RuntimeError as e:
             self.assertTrue(e.args[0].startswith("[predict] Error processing 'CallOp(<lambda>)': invalid literal for int() with base 10: 'grr'"))
@@ -138,7 +140,7 @@ class SearchTest(RuntimeTest):
         pred = X2.skb.apply(DummyRegressor(), y=y)
         # capture stdout
         with redirect_stdout(StringIO()) as stdout, st.config(stats=True, stats_top_k=20):
-            st._api.grid_search(pred, return_predictions=False)
+            st._api.grid_search(pred, scoring="neg_mean_squared_error", return_predictions=False)
         out = stdout.getvalue()
         out = out.split("\n")
         self.assertIn("Heavy hitters", out[2])
@@ -159,7 +161,7 @@ class SearchTest(RuntimeTest):
         X = X.assign(year=date.dt.year)
         X = X.drop(columns=["datetime"])
         pred = X.skb.apply(DummyRegressor(), y=y)
-        st._api.grid_search(pred)
+        st._api.grid_search(pred, scoring="neg_mean_squared_error")
 
 
 class CrossValidationSplitterTest(unittest.TestCase):

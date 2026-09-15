@@ -25,7 +25,7 @@ class TestNumericOps(unittest.TestCase):
         pred = t2.skb.apply(DummyRegressor(), y=y_exp)
 
         with st.config(scheduler=True):
-            pred.skb.make_grid_search(cv=3)
+            pred.skb.make_grid_search(cv=3, scoring="neg_mean_squared_error")
 
     def test_to_numeric_op_abs(self):
         data = st.as_data_op(self.df)
@@ -35,7 +35,7 @@ class TestNumericOps(unittest.TestCase):
         pred = t1.skb.apply(DummyRegressor(), y=y)
 
         with st.config(scheduler=True):
-            pred.skb.make_grid_search(cv=3)
+            pred.skb.make_grid_search(cv=3, scoring="neg_mean_squared_error")
 
     def test_process_log(self):
         op = NumericOp(inputs=[], outputs=None, func=np.log)

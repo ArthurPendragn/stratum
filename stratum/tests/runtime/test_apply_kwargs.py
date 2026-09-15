@@ -74,14 +74,11 @@ class ApplyKwargsRuntimeTest(unittest.TestCase):
         self.df = _frame()
 
     def assert_matches_skrub(self, pipeline, cv=2):
-        """Both engines must fit the same model, so their fold scores must agree.
-
-        stratum reports the raw scorer value, skrub the signed one.
-        """
+        """Both engines must fit the same model, so their fold scores must agree."""
         ours = grid_search(pipeline, cv=cv, scoring=self.SCORING)
         theirs = pipeline.skb.make_grid_search(cv=cv, fitted=True, refit=False,
                                                scoring=self.SCORING)
-        np.testing.assert_allclose(theirs.results_["mean_test_score"] * -1,
+        np.testing.assert_allclose(theirs.results_["mean_test_score"],
                                    ours.results_["scores"], rtol=1e-9)
 
 
@@ -112,7 +109,7 @@ class TestFitKwargsReachFit(ApplyKwargsRuntimeTest):
         X = data.drop(columns=["y", "w"]).skb.mark_as_X()
         pipeline = X.skb.apply(LinearRegression(), y=y, fit_kwargs={"nonexistent": 1})
         with self.assertRaises(RuntimeError) as ctx:
-            grid_search(pipeline, cv=2)
+            grid_search(pipeline, cv=2, scoring=self.SCORING)
         self.assertIn("unexpected keyword argument 'nonexistent'", str(ctx.exception))
 
 
@@ -126,7 +123,8 @@ class TestKwargsAreRoutedPerMethod(ApplyKwargsRuntimeTest):
         y = data["y"].skb.mark_as_y()
         X = data.drop(columns=["y", "w"]).skb.mark_as_X()
         transformed = X.skb.apply(RecordingTransformer(), how="no_wrap", **apply_kwargs)
-        grid_search(transformed.skb.apply(LinearRegression(), y=y), cv=2)
+        grid_search(transformed.skb.apply(LinearRegression(), y=y), cv=2,
+                    scoring=self.SCORING)
         return dict(RecordingTransformer.CALLS)
 
     def test_transform_kwargs_only_reach_transform(self):

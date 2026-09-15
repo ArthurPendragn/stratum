@@ -6,7 +6,7 @@ class SplitOpTest(unittest.TestCase):
     def test_train_test_split(self):
         pipeline = simple_pipeline()
         with st.config(scheduler=True):
-            search = pipeline.skb.make_grid_search()
+            search = pipeline.skb.make_grid_search(scoring="neg_mean_squared_error")
             print(search.results_)
 
 

@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import stratum as st
 from sklearn.dummy import DummyRegressor
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.preprocessing import StandardScaler
 
 from stratum.optimizer._op_cse import apply_op_cse
@@ -131,13 +131,29 @@ class TestKwargsBinding(ApplyKwargsTest):
 
 class TestUnsupportedKwargs(ApplyKwargsTest):
     def test_group_for_a_method_stratum_never_calls_raises(self):
+        """`score` is the one group Stratum will not gain: a search names its metric."""
         X, y = self._source()
-        for group in ("predict_proba_kwargs", "decision_function_kwargs", "score_kwargs"):
-            with self.subTest(group=group):
-                dag = X.skb.apply(Ridge(), y=y, **{group: {"a": 1}})
-                with self.assertRaises(NotImplementedError) as ctx:
-                    convert_to_ops(dag)
-                self.assertIn(group.removesuffix("_kwargs"), str(ctx.exception))
+        dag = X.skb.apply(Ridge(), y=y, score_kwargs={"a": 1})
+        with self.assertRaises(NotImplementedError) as ctx:
+            convert_to_ops(dag)
+        self.assertIn("score", str(ctx.exception))
+
+    def test_response_group_the_estimator_cannot_serve_warns(self):
+        """Ridge has no `predict_proba`, so that group is dead -- as it is under skrub."""
+        X, y = self._source()
+        dag = X.skb.apply(Ridge(), y=y, predict_proba_kwargs={"a": 1})
+        with self.assertLogs("stratum", level="WARNING") as logs:
+            convert_to_ops(dag)
+        self.assertIn("predict_proba", "\n".join(logs.output))
+
+    def test_response_group_is_bound_when_the_estimator_serves_it(self):
+        """A `predict_proba` pass splats them, so they are no longer rejected."""
+        X, y = self._source()
+        dag = X.skb.apply(LogisticRegression(), y=y, predict_proba_kwargs={"a": 1})
+        ops = list(topological_iterator(convert_to_ops(dag)))
+        op = next(o for o in ops if isinstance(o, PredictorOp))
+        self.assertIn("predict_proba", op.kwargs)
+        self.assertIn("predict_proba", op.supported_modes)
 
     def test_choice_inside_kwargs_raises(self):
         # A choice would have to expand the parameter grid; its DataOp outcomes are

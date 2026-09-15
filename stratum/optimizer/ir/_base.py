@@ -228,6 +228,8 @@ class IRNode:
         self.is_split_op = False
         self.was_cloned = False
         self.remove_after: list[IRNode] = []
+        #: Set by fit-pass planning: nothing the fitting pass runs needs this output.
+        self.dead_in_fit = False
 
     def to_str_helper(self):
         class_name = (self.__class__.__name__ if self._is_physical

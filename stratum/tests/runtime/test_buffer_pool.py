@@ -108,7 +108,7 @@ class TestBufferPoolIntegration(RuntimeTest):
     def test_grid_search_runs(self):
         """Grid search with buffer manager completes without error."""
         pred_opt = simple_pipeline()
-        results = grid_search(pred_opt, cv=2)
+        results = grid_search(pred_opt, cv=2, scoring="neg_mean_squared_error")
         self.assertIsNotNone(results)
         
     def test_buffer_pool_evictions(self):
@@ -125,7 +125,7 @@ class TestBufferPoolIntegration(RuntimeTest):
 
         with self.assertLogs("stratum", level="DEBUG") as logs:
             with config(scheduler=True, buffer_pool_memory_budget=24000, DEBUG=True):
-                search = pred.skb.make_grid_search(cv=2)
+                search = pred.skb.make_grid_search(cv=2, scoring="neg_mean_squared_error")
         self.assertIsNotNone(search)
         evictions = [line for line in logs.output if "Evicted" in line]
         self.assertEqual(len(evictions), 12, msg="\n".join(logs.output))

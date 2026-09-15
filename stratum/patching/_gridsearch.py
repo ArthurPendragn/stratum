@@ -12,26 +12,21 @@ def _stratum_make_grid_search(self, *, fitted=False, keep_subsampling=False, **k
     When scheduler mode is enabled, uses Stratum's optimized grid search.
     Otherwise, falls back to the original skrub implementation.
     """
-    if FLAGS.scheduler:
+    # Note: We extract instead of pop to avoid mutating kwargs
+    scoring = kwargs.get("scoring", None)
+    # skrub's own default, scoring=None, means the estimator's `score`. Stratum refuses
+    # that for a search (ADR 0004), but refusing it here would break the drop-in contract
+    # (ADR 0002), so the call goes to unpatched skrub unchanged instead.
+    if FLAGS.scheduler and scoring is not None:
         # Use Stratum's scheduler-based grid search
-        # Extract kwargs that are relevant for grid_search
-        # Note: We extract instead of pop to avoid mutating kwargs
-        cv = kwargs.get("cv", None)
-        scoring = kwargs.get("scoring", None)
-        return_predictions = kwargs.get("return_predictions", False)
-        
-        # Get the DataOp from the namespace instance
-        dag = self._data_op
-        # Call Stratum's grid_search
         return stratum_grid_search(
-            dag=dag,
-            cv=cv,
+            dag=self._data_op,
+            cv=kwargs.get("cv", None),
             scoring=scoring,
-            return_predictions=return_predictions
+            return_predictions=kwargs.get("return_predictions", False),
         )
-    else:
-        # Fall back to original implementation
-        return _original_make_grid_search(self, fitted=fitted, keep_subsampling=keep_subsampling, **kwargs)
+    # Fall back to original implementation
+    return _original_make_grid_search(self, fitted=fitted, keep_subsampling=keep_subsampling, **kwargs)
 
 
 # This will be used by the patching system to replace the method
