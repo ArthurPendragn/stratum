@@ -7,9 +7,11 @@ import warnings
 
 import numpy as np
 import pandas as pd
+import polars as pl
 import pytest
 import skrub
 from sklearn.preprocessing import OneHotEncoder
+from polars.testing import assert_frame_equal as assert_polars_frame_equal
 from skrub import StringEncoder, TableVectorizer
 from skrub._utils import random_string
 
@@ -18,8 +20,14 @@ from stratum.adapters.table_vectorizer import (
     StratumFusedTableVectorizer,
     _FusedTableVectorizer,
 )
-from stratum.adapters.one_hot_encoder import RustyOneHotEncoder
-from stratum.adapters.string_encoder import RustyStringEncoder
+from stratum.adapters.one_hot_encoder import (
+    RustyOneHotEncoder,
+    supports_rust_one_hot_encoder,
+)
+from stratum.adapters.string_encoder import (
+    RustyStringEncoder,
+    supports_rust_string_encoder,
+)
 
 
 def _string_encoder(n_components=2):
@@ -225,6 +233,72 @@ def test_exact_fused_matches_reference_for_default_column_roles(X):
     reference_test = reference.transform(X)
     fused_test = fused.transform(X)
     pd.testing.assert_frame_equal(reference_test, fused_test, check_exact=True)
+
+
+def test_exact_fused_supports_polars_and_matches_reference():
+    X = pl.DataFrame(
+        {
+            "numeric": [1.0, None, 3.0, 4.0, 5.0],
+            "category": ["a", "b", None, "a", "c"],
+            "date": [
+                "2024-01-01",
+                "2024-01-02",
+                "2024-01-03",
+                "2024-01-04",
+                "2024-01-05",
+            ],
+            "high": ["one", "two", "three", "four", "five"],
+        }
+    )
+    params = {
+        "cardinality_threshold": 5,
+        "high_cardinality": "drop",
+    }
+    reference = TableVectorizer(**params)
+    fused = ExactFusedTableVectorizer(**params)
+
+    reference_output = reference.fit_transform(X)
+    fused_output = fused.fit_transform(X)
+
+    assert isinstance(reference_output, pl.DataFrame)
+    assert isinstance(fused_output, pl.DataFrame)
+    assert_polars_frame_equal(reference_output, fused_output)
+    assert_polars_frame_equal(reference.transform(X), fused.transform(X))
+
+
+def test_stratum_fused_supports_polars_with_rust_leaves():
+    X = pl.DataFrame(
+        {
+            "low": ["a", "b", "a", "b"],
+            "high": ["alpha", "bravo", "charlie", "delta"],
+            "number": [1, 2, 3, 4],
+        }
+    )
+    vectorizer = StratumFusedTableVectorizer(
+        cardinality_threshold=3,
+        high_cardinality=_string_encoder(),
+    )
+
+    fitted = vectorizer.fit_transform(X)
+    transformed = vectorizer.transform(X)
+
+    assert isinstance(fitted, pl.DataFrame)
+    assert isinstance(transformed, pl.DataFrame)
+    assert fitted.shape[1] == transformed.shape[1]
+    assert fitted.columns == vectorizer.all_outputs_
+    assert transformed.columns == vectorizer.all_outputs_
+    if supports_rust_one_hot_encoder(vectorizer.low_cardinality)[0]:
+        assert isinstance(vectorizer.transformers_["low"], RustyOneHotEncoder)
+    if supports_rust_string_encoder(vectorizer.high_cardinality)[0]:
+        assert isinstance(vectorizer.transformers_["high"], RustyStringEncoder)
+
+
+def test_fused_polars_fit_rejects_pandas_transform():
+    X = pl.DataFrame({"value": [1, 2, 3]})
+    vectorizer = ExactFusedTableVectorizer().fit(X)
+
+    with pytest.raises(TypeError, match="fitted to a polars dataframe"):
+        vectorizer.transform(X.to_pandas())
 
 
 def test_cardinality_boundary_is_strict_and_routes_once():

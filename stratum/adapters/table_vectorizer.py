@@ -13,7 +13,6 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from threading import BoundedSemaphore, Lock
 
-import pandas as pd
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.utils.validation import check_is_fitted
 from threadpoolctl import threadpool_limits
@@ -70,7 +69,7 @@ class _FrameColumn:
     """A column currently present in the logical frame, with its owner."""
 
     owner: _ColumnPlan
-    column: pd.Series
+    column: object
 
 
 @dataclass(frozen=True)
@@ -138,11 +137,11 @@ class _FusedTableVectorizer(_SkrubTableVectorizer):
             )
 
     @staticmethod
-    def _check_pandas_input(X):
-        if not isinstance(X, pd.DataFrame):
+    def _check_dataframe_input(X):
+        if not sbd.is_dataframe(X):
             raise TypeError(
-                "Fused TableVectorizer implementations only support pandas "
-                "DataFrame input."
+                "Fused TableVectorizer implementations only support pandas or "
+                "polars DataFrame input."
             )
 
     # =========== Helper methods (thin wrappers around skrub) ===========
@@ -242,7 +241,7 @@ class _FusedTableVectorizer(_SkrubTableVectorizer):
 
     def fit_transform(self, X, y=None):
         """Fit the fused runtime and return one assembled dataframe."""
-        self._check_pandas_input(X)
+        self._check_dataframe_input(X)
         self._check_supported_configuration()
 
         # The input checker is the one unavoidable full-frame preprocessing.
@@ -447,7 +446,7 @@ class _FusedTableVectorizer(_SkrubTableVectorizer):
     def transform(self, X):
         """Transform with the fitted ordered column plan."""
         check_is_fitted(self, "transformers_")
-        self._check_pandas_input(X)
+        self._check_dataframe_input(X)
 
         t = start_time()
         checked = self._input_checker.transform(X)
