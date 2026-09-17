@@ -71,6 +71,7 @@ class _Flags:
     stats_top_k: int = 20
     debug_graph: bool = False
     open_graph: bool = False
+    graph_format: str = "svg"
     explain: tuple[str, ...] = ()
     cse: bool = True
     DEBUG: bool = False
@@ -96,6 +97,7 @@ def set_config(rust_backend: bool | None = None,
     scheduler: bool = False,
     debug_graph: bool = False,
     open_graph: bool = False,
+    graph_format: str = "svg",
     explain: bool | str | list[str] | None = None,
     DEBUG: bool | None = None,
     force_polars: bool = False,
@@ -139,6 +141,15 @@ def set_config(rust_backend: bool | None = None,
 
         open_graph: bool, default true
             Open the graph after optimization.
+
+        graph_format: str, default "svg"
+            Output format of the debug graphs. Keep "svg" for anything but a
+            small plan: the bitmap formats ("png", "jpg") are capped at 32767
+            pixels per side by the cairo renderer, and graphviz silently scales
+            a larger drawing down to fit, which is what turns the labels of a
+            big plan into unreadable smudge. SVG has no such cap, renders about
+            10x faster, and leaves the labels as real text the browser can
+            search.
 
         explain: bool | str | list[str], default None
             Print text-based linear execution plans during optimization. ``True``
@@ -201,6 +212,7 @@ def set_config(rust_backend: bool | None = None,
     FLAGS.cse = bool(cse)
     FLAGS.debug_graph = bool(debug_graph)
     FLAGS.open_graph = bool(open_graph)
+    FLAGS.graph_format = str(graph_format)
     FLAGS.buffer_pool_memory_budget = int(buffer_pool_memory_budget)
     FLAGS.explain = _read_explain_levels(explain)
     FLAGS.make_selection_op = bool(make_selection_op)

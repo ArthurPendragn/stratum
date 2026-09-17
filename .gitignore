@@ -99,6 +99,10 @@ benchmarks-staging
 *.ipynb
 *.npy
 *.png
+*.svg
+
+# generated debug plans (show_graph writes graphs/ relative to the cwd)
+graphs/
 
 # coding agents
 .cursor

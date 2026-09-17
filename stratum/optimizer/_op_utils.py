@@ -195,8 +195,23 @@ def validate_dag(root: Op) -> None:
 
 
 def show_graph(root: Op, filename: str = 'plan'):
-    """Show the runtime plan of the DataOp DAG."""
-    dot = Digraph(comment=filename, format='png', graph_attr={'rankdir': 'BT'})
+    """Show the runtime plan of the DataOp DAG.
+
+    Rendered as SVG by default (see the ``graph_format`` config flag). A plan of
+    any size lays out wider than the 32767 pixel side that the cairo renderer
+    caps bitmaps at, and graphviz reacts by scaling the whole drawing down to
+    fit, which shrinks the labels past legibility. SVG carries no such cap.
+
+    The DOT source is kept next to the rendered file so a plan can be laid out
+    again -- other format, other engine, other attributes -- without paying for
+    the pipeline that produced it.
+    """
+    dot = Digraph(
+        comment=filename,
+        format=get_config()["graph_format"],
+        graph_attr={'rankdir': 'BT', 'ranksep': '0.3', 'nodesep': '0.2'},
+        node_attr={'fontname': 'Helvetica', 'fontsize': '11'},
+    )
     for current_op in topological_iterator(root):
         validate_operands(current_op)
         current_op.update_name()
@@ -205,9 +220,11 @@ def show_graph(root: Op, filename: str = 'plan'):
         dot.node(str(id(current_op)), name)
         for outputs in current_op.outputs:
             dot.edge(str(id(current_op)), str(id(outputs)))
-    filename = "graphs/" + filename
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
-    out_path = os.path.abspath(dot.render(filename, view=False, cleanup=True))
+    base = os.path.join("graphs", filename)
+    os.makedirs(os.path.dirname(base), exist_ok=True)
+    out_path = os.path.abspath(
+        dot.render(filename=base + ".dot", outfile=f"{base}.{dot.format}",
+                   view=False, cleanup=True))
     if get_config()["open_graph"]:
         webbrowser.open(f"file://{out_path}")
         
