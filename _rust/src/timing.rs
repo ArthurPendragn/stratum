@@ -1,29 +1,15 @@
-use once_cell::sync::Lazy;
 use std::time::Instant;
-
-// Thread-safe check on the first use
-static NUM_THREADS: Lazy<usize> = Lazy::new(|| {
-    match std::env::var("SKRUB_RUST_THREADS") {
-        Ok(num) => num.parse().unwrap_or(0),
-        _ => 0,
-    }
-});
 
 #[inline]
 pub fn debug_enabled() -> bool {
     // Read in each call to allow dynamic change
-    let debug: Lazy<bool> = Lazy::new(|| {
+    let debug: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
         std::env::var("SKRUB_RUST_DEBUG_TIMING")
             .map(|v| matches!(v.to_lowercase().as_str(), "1"))
             .unwrap_or(false)
     });
 
     *debug
-}
-
-#[inline]
-pub fn get_num_threads() -> usize {
-    *NUM_THREADS
 }
 
 #[inline]

@@ -1,8 +1,29 @@
 use ndarray::{Array2, ArrayView2, Axis, s};
 use ndarray_linalg::{SVDInto, SVD};
-use rayon::{ThreadPool};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods};
+use pyo3::prelude::*;
+use rand::{rngs::StdRng, Rng, SeedableRng};
+use rayon::ThreadPool;
 use rayon::prelude::*;
-use pyo3::{exceptions::PyValueError, PyErr};
+use pyo3::exceptions::PyValueError;
+use std::sync::Arc;
+
+use crate::threads::get_thread_pool;
+use crate::timing::{print_timing, start_timing};
+
+/// Python-owned fitted Frequent-Directions state.
+#[pyclass(name = "_FdEmbedModelHandle", frozen)]
+pub(crate) struct FdEmbedModel {
+    n_cols: usize,
+    k: usize,
+    oversample: usize,
+    // Projection matrix P: (m × k) where m = k + oversample
+    projection: Arc<Array2<f32>>,
+    // Random matrix Ω: (n_cols × m) stored column-major for efficient CSR matmul
+    // omega[j * m + t] = Ω[j, t]
+    omega: Arc<Vec<f32>>,
+    m: usize,  // m = k + oversample, width of reduced space
+}
 
 // Simple Frequent Directions (FD) implementation for a tall matrix Y (n x m), where
 // m is small (≈ k+p). Maintain a sketch B (l x m) with l = 2k (or slightly larger), then shrinks.
@@ -168,4 +189,293 @@ fn shrink(b: &mut Array2<f32>, k: usize) -> Result<(), PyErr> {
     ndarray::linalg::general_mat_mul(1.0, &u_view, &vt_view, 0.0, b);
 
     Ok(())
+}
+
+// Helper: CSR × Omega matmul: X @ Ω -> Y
+// Omega is stored column-major: omega[j * m + t] = Ω[j, t]
+// Result Y is (n_rows × m)
+fn csr_matmul_omega(
+    data: &[f32],
+    indices: &[i32],
+    indptr: &[i64],
+    n_rows: usize,
+    n_cols: usize,
+    omega: &[f32],
+    m: usize,
+    pool_ref: Option<&rayon::ThreadPool>,
+) -> Array2<f32> {
+    let mut y = Array2::<f32>::zeros((n_rows, m));
+    let mut build_y = || {
+        y.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .enumerate()
+            .for_each(|(row, mut yrow)| {
+                let start = indptr[row] as usize;
+                let end = indptr[row + 1] as usize;
+                for t in 0..m {
+                    let mut acc = 0.0f32;
+                    for p in start..end {
+                        let j = indices[p] as usize;
+                        let v = data[p];
+                        acc += v * omega[j * m + t];
+                    }
+                    yrow[t] = acc;
+                }
+            });
+    };
+    match pool_ref {
+        Some(p) => p.install(build_y),
+        None => build_y(),
+    }
+    y
+}
+
+fn compute_fd_embed(data: &[f32], indices: &[i32], indptr: &[i64],
+    n_rows: usize, n_cols: usize, k: usize, oversample: usize, seed: Option<u64>) -> Result<Array2<f32>, PyErr>
+{
+    // Step 2: Gather the parameters
+    let out_w = k + oversample; //k+p
+    let s = seed.unwrap_or(0xC0FFEE); //I love coffee :)
+
+    // Step 3: Build Ω (d x out_w), but don't store full Ω. Generate on the fly per-column.
+    // We pre-allocate Ω^T as Vec<Vec<f32>>; width is small (<= 128).
+    // Do all heavy work without the GIL (detach closure)
+    // TODO: Avoid materializing omega. Stream random f32 numbers in during building Y
+    let mut rng = StdRng::seed_from_u64(s);
+    let mut omega_t: Vec<Vec<f32>> = Vec::with_capacity(out_w);
+    for _ in 0..out_w {
+        let mut col: Vec<f32> = Vec::with_capacity(n_cols);
+        for _ in 0..n_cols {
+            let r: f32 = if rng.random::<bool>() { 1.0 } else { -1.0 };
+            col.push(r); //col is a vector of 1s and -1s
+        }
+        omega_t.push(col);
+    }
+
+    // Get rayon thread pool
+    let pool = get_thread_pool();
+
+    // Step 4: Compute Y = X · Ω  (n x out_w) in a single pass over CSR rows
+    // TODO: Move this to CSR utility module
+    let t0 = start_timing();
+    let mut y = Array2::<f32>::zeros((n_rows, out_w)); //dense y
+    let mut build_y = || {
+        y.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .enumerate()
+            .for_each(|(row, mut yrow)| {
+                let start = indptr[row] as usize;
+                let end   = indptr[row + 1] as usize;
+                for t in 0..out_w {
+                    let mut acc = 0.0f32;
+                    for p in start..end {
+                        let j = indices[p] as usize;
+                        let v = data[p];
+                        acc += v * omega_t[t][j];
+                    }
+                    yrow[t] = acc;
+                }
+            });
+    };
+    match pool {
+        Some(p) => p.install(build_y), //use custom threadpool
+        None => build_y() //use global threadpool
+    }
+    print_timing("build y", t0);
+
+    // Step 5: Run FD on Y (n x out_w) -> Z (n x k)
+    // FD operates on small width (out_w), making it cheap
+    let t0 = start_timing();
+    let z = fd_reduce(y.view(), k, pool)?;
+    print_timing("fd_reduce", t0);
+    Ok(z)
+}
+
+#[pyfunction]
+#[pyo3(signature = (data, indices, indptr, n_rows, n_cols, k, oversample=16, seed=None))]
+fn fd_embed_from_csr(py: Python<'_>, data: Bound<PyArray1<f32>>, indices: Bound<PyArray1<i32>>,
+    indptr: Bound<PyArray1<i64>>, n_rows: usize, n_cols: usize, k: usize,
+    oversample: usize, seed: Option<u64>) -> PyResult<Py<PyArray2<f32>>>
+{
+    // Step 1: Zero-copy view of NumPy arrays
+    let data = unsafe { data.as_slice()? };
+    let indices = unsafe { indices.as_slice()? };
+    let indptr = unsafe { indptr.as_slice()? };
+
+    let z = py.detach(||
+        compute_fd_embed(data, indices, indptr, n_rows, n_cols, k, oversample, seed))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("fd_embed failed: {e}")))?;
+
+    // Step 6: Return NumPy (zero-copy)
+    let py_z = z.into_pyarray(py).to_owned();
+    Ok(Py::from(py_z))
+}
+
+fn compute_fd_fit(
+    data: &[f32],
+    indices: &[i32],
+    indptr: &[i64],
+    n_rows: usize,
+    n_cols: usize,
+    k: usize,
+    oversample: usize,
+    seed: Option<u64>,
+) -> Result<(FdEmbedModel, Array2<f32>), PyErr> {
+    let m = k + oversample;
+    let s = seed.unwrap_or(0xC0FFEE);
+
+    // Generate Ω matrix (n_cols × m) in column-major format
+    let mut rng = StdRng::seed_from_u64(s);
+    let mut omega = Vec::<f32>::with_capacity(n_cols * m);
+    for _ in 0..(n_cols * m) {
+        let r: f32 = if rng.random::<bool>() { 1.0 } else { -1.0 };
+        omega.push(r);
+    }
+
+    // Get rayon thread pool
+    let pool = get_thread_pool();
+
+    // Compute Y = X @ Ω (n_rows × m)
+    let t0 = start_timing();
+    let y = csr_matmul_omega(data, indices, indptr, n_rows, n_cols, &omega, m, pool);
+    print_timing("build y (fd_fit)", t0);
+
+    // Run FD to get projection matrix P and reduced embeddings Z
+    let t0 = start_timing();
+    let (z, projection) = fd_fit(y.view(), k, pool)?;
+    print_timing("fd_fit", t0);
+
+    // The model is allocated and remains in the Rust heap
+    let model = FdEmbedModel {
+        n_cols,
+        k,
+        oversample,
+        projection: Arc::new(projection),
+        omega: Arc::new(omega),
+        m,
+    };
+
+    Ok((model, z))
+}
+
+#[pyfunction]
+#[pyo3(signature = (data, indices, indptr, n_rows, n_cols, k, oversample=16, seed=None))]
+pub(crate) fn fd_fit_from_csr(
+    py: Python<'_>,
+    data: Bound<PyArray1<f32>>,
+    indices: Bound<PyArray1<i32>>,
+    indptr: Bound<PyArray1<i64>>,
+    n_rows: usize,
+    n_cols: usize,
+    k: usize,
+    oversample: usize,
+    seed: Option<u64>,
+) -> PyResult<(Py<FdEmbedModel>, Py<PyArray2<f32>>)> {
+    // Zero-copy view of NumPy arrays
+    let data = unsafe { data.as_slice()? };
+    let indices = unsafe { indices.as_slice()? };
+    let indptr = unsafe { indptr.as_slice()? };
+
+    let (model, z) = py
+        .detach(|| compute_fd_fit(data, indices, indptr, n_rows, n_cols, k, oversample, seed))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("fd_fit failed: {e}")))?;
+
+    // The fitted state (wrapper) is owned by Python and released with its last reference.
+    let model = Py::new(py, model)?;
+    let py_z = z.into_pyarray(py).to_owned();
+    Ok((model, Py::from(py_z)))
+}
+
+fn compute_fd_transform(
+    projection: Arc<Array2<f32>>,
+    omega: Arc<Vec<f32>>,
+    model_n_cols: usize,
+    m: usize,
+    data: &[f32],
+    indices: &[i32],
+    indptr: &[i64],
+    n_rows: usize,
+    n_cols: usize,
+) -> Result<Array2<f32>, PyErr> {
+    // Validate cols match
+    if n_cols != model_n_cols {
+        return Err(PyErr::new::<PyValueError, _>(format!(
+            "n_cols mismatch: input n_cols={} but model expects {}",
+            n_cols, model_n_cols
+        )));
+    }
+
+    let pool = get_thread_pool();
+
+    // Compute Y_new = X_new @ Ω (n_rows × m)
+    let t0 = start_timing();
+    let y_new = csr_matmul_omega(data, indices, indptr, n_rows, n_cols, &omega, m, pool);
+    print_timing("build y_new (fd_transform)", t0);
+
+    // Apply projection Z_new = Y_new @ P (n_rows × k)
+    let t0 = start_timing();
+    let k = projection.ncols();
+    let mut z_new = Array2::<f32>::zeros((n_rows, k));
+    let mut apply_projection = || {
+        z_new
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .zip(y_new.axis_iter(Axis(0)))
+            .for_each(|(mut zrow, yrow)| {
+                for r in 0..k {
+                    let mut sum = 0.0f32;
+                    for c in 0..m {
+                        sum += yrow[c] * projection[(c, r)];
+                    }
+                    zrow[r] = sum;
+                }
+            });
+    };
+    match pool {
+        Some(p) => p.install(apply_projection),
+        None => apply_projection(),
+    }
+    print_timing("apply projection (fd_transform)", t0);
+
+    Ok(z_new)
+}
+
+#[pyfunction]
+#[pyo3(signature = (model_id, data, indices, indptr, n_rows, n_cols))]
+pub(crate) fn fd_transform_from_csr(
+    py: Python<'_>,
+    model_id: PyRef<'_, FdEmbedModel>,
+    data: Bound<PyArray1<f32>>,
+    indices: Bound<PyArray1<i32>>,
+    indptr: Bound<PyArray1<i64>>,
+    n_rows: usize,
+    n_cols: usize,
+) -> PyResult<Py<PyArray2<f32>>> {
+    let data = unsafe { data.as_slice()? };
+    let indices = unsafe { indices.as_slice()? };
+    let indptr = unsafe { indptr.as_slice()? };
+    let projection = Arc::clone(&model_id.projection);
+    let omega = Arc::clone(&model_id.omega);
+    let model_n_cols = model_id.n_cols;
+    let m = model_id.m;
+    drop(model_id);
+
+    let z = py
+        .detach(|| {
+            compute_fd_transform(
+                projection,
+                omega,
+                model_n_cols,
+                m,
+                data,
+                indices,
+                indptr,
+                n_rows,
+                n_cols,
+            )
+        })
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("fd_transform failed: {e}")))?;
+
+    let py_z = z.into_pyarray(py).to_owned();
+    Ok(Py::from(py_z))
 }

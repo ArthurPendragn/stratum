@@ -1,9 +1,9 @@
 use ndarray::{Array2, Axis};
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, ToPyArray};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use crate::threads::get_thread_pool;
-use crate::util::{print_timing, start_timing};
+use crate::timing::{print_timing, start_timing};
 
 // Pure Rust compute to run without GIL
 fn compute_ohe_transform_csr(

@@ -14,6 +14,27 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def test_native_extension_exports_expected_api():
+    expected = {
+        "_FdEmbedModelHandle",
+        "_TfidfModelHandle",
+        "_TruncatedSvdModelHandle",
+        "csr_to_dense",
+        "fd_fit_from_csr",
+        "fd_transform_from_csr",
+        "hashing_tfidf_csr",
+        "hashing_tfidf_csr_with_idf",
+        "ohe_transform_csr",
+        "tfidf_fit_csr",
+        "tfidf_transform_csr",
+        "truncated_svd_fit_from_csr",
+        "truncated_svd_transform_from_csr",
+    }
+
+    actual = {name for name in dir(rb.native) if not name.startswith("__")}
+    assert actual == expected
+
+
 def _fit_tfidf():
     strings = [
         "alpha beta",
