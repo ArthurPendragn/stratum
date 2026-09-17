@@ -619,8 +619,32 @@ class UnaryOp(Op):
         return self.op(operand)
 
 def _bind_or_value(binder: OperandBinder, value):
-    """Bind a field that is either a single DataOp (-> OperandRef) or a constant."""
-    return binder.ref(value) if isinstance(value, DataOp) else value
+    """Bind a field holding DataOps (-> OperandRefs), constants, or a mix of both.
+
+    Delegates to :meth:`OperandBinder.bind`, which recurses the same containers
+    ``_collect_child_data_ops`` does. Binding has to follow that walk exactly:
+    graph extraction already reported every DataOp it finds -- including ones
+    nested in a tuple, such as the row/column pair of ``df.loc[mask, cols]`` --
+    as a child of this node, so a DataOp left unbound here stays in the DAG with
+    no consumer and the topological walk then trips over a node it has no
+    in-degree entry for.
+    """
+    return binder.bind(value)
+
+
+def _getitem_key_name(key) -> str:
+    """Display label for a ``df[key]`` indexer.
+
+    A DataOp key is labelled by its impl class (``BinOp``, ...) rather than its
+    repr; a tuple key -- the two axes of ``df.loc[rows, cols]`` -- is labelled
+    per axis, so the op reads as ``(BinOp, ['gid'])`` instead of embedding a
+    DataOp repr.
+    """
+    if isinstance(key, DataOp):
+        return key._skrub_impl.__class__.__name__
+    if isinstance(key, tuple):
+        return f"({', '.join(_getitem_key_name(k) for k in key)})"
+    return str(key)
 
 
 # Method groups reachable from stratum's two execution modes: which of the two a
@@ -803,8 +827,7 @@ def as_op(data_op: DataOp, ids_to_ops: dict, env: dict | None = None) -> Op:
     elif isinstance(impl, GetItem):
         binder.ref(impl.container)  # OperandRef(0)
         key = _bind_or_value(binder, impl.key)
-        name = impl.key._skrub_impl.__class__.__name__ if isinstance(impl.key, DataOp) else str(impl.key)
-        return_op = GetItemOp(key=key, name=name)
+        return_op = GetItemOp(key=key, name=_getitem_key_name(impl.key))
         return_op.inputs = binder.inputs
     elif isinstance(impl, SkrubBinOp):
         left = _bind_or_value(binder, impl.left)

@@ -1,5 +1,8 @@
 import unittest
+import numpy as np
 from sklearn.datasets import make_regression
+from sklearn.dummy import DummyRegressor
+from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
 import skrub
 from sklearn.ensemble import RandomForestRegressor
@@ -81,6 +84,63 @@ class EvaluateTest(RuntimeTest):
         x_scaled = x.skb.apply(StandardScaler())
         pred = x_scaled.skb.apply(RandomForestRegressor(random_state=42), y=y)
         self.compare_evaluate(pred)
+
+
+class TwoAxisIndexerTest(RuntimeTest):
+    """A `.loc`/`.iloc` that indexes rows *and* columns in one call.
+
+    The row indexer is a DataOp nested in the key's tuple; leaving it unbound used
+    to orphan the whole mask sub-DAG, so the plan raised "op ... should not exist in
+    the DAG" while compiling -- before any data was touched, and only on the
+    scheduler path. These pin the values too, not just that a plan builds.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.side = pd.DataFrame({
+            "gid": [1, 2, 3] * 10,
+            "category": list("abc") * 10,
+            "w": np.arange(30.0),
+        })
+
+    def _pipeline(self, select):
+        data = skrub.as_data_op(self.df)
+        side = skrub.var("side", self.side)
+        x = data[["x"]].skb.mark_as_X()
+        y = data["y"].skb.mark_as_y()
+        return x.assign(n=select(side)).skb.apply(DummyRegressor(), y=y)
+
+    def test_row_mask_and_column_list(self):
+        self.compare_evaluate(self._pipeline(
+            lambda s: s.loc[s["category"] == "a", ["gid"]]["gid"].nunique()))
+
+    def test_row_mask_and_single_column(self):
+        self.compare_evaluate(self._pipeline(
+            lambda s: s.loc[s["category"] == "a", "w"].sum()))
+
+    def test_compound_row_mask(self):
+        self.compare_evaluate(self._pipeline(
+            lambda s: s.loc[(s["category"] == "a") & (s["w"] > 3), ["gid"]]["gid"].nunique()))
+
+    def test_row_mask_shared_by_two_indexers(self):
+        # The same mask feeds two `.loc`s, so it is bound twice and CSE collapses it.
+        self.compare_evaluate(self._pipeline(
+            lambda s: s.loc[s["category"] == "a", ["gid"]]["gid"].nunique()
+                    + s.loc[s["category"] == "a", ["w"]]["w"].sum()))
+
+    def test_positional_two_axis_iloc(self):
+        self.compare_evaluate(self._pipeline(lambda s: s.iloc[0:9, [0]]["gid"].nunique()))
+
+    def test_scheduler_grid_search_scores_like_skrub(self):
+        # The reported symptom: the plan compiled fine on the default engine and
+        # raised only under `config(scheduler=True)`, at scoring time.
+        pipeline = self._pipeline(
+            lambda s: s.loc[s["category"] == "a", ["gid"]]["gid"].nunique())
+        ours = stratum._api.grid_search(pipeline, cv=KFold(n_splits=2), scoring="r2")
+        theirs = pipeline.skb.make_grid_search(
+            fitted=True, cv=KFold(n_splits=2), scoring="r2")
+        np.testing.assert_allclose(theirs.results_["mean_test_score"],
+                                   ours.results_["scores"], rtol=1e-9)
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,7 +20,8 @@ from stratum.optimizer.logical._ops import (
 from stratum.optimizer.logical._numeric_ops import NumericOp, NumericOpType
 from stratum.optimizer.logical._selection_ops import SelectionOp, SelectionKind
 from stratum.optimizer.logical._column_expr import BinOpExpr, Col, OperandLeaf
-from stratum.optimizer._optimize import optimize as optimize_
+from stratum.optimizer._op_utils import topological_iterator, validate_dag
+from stratum.optimizer._optimize import convert_to_ops, optimize as optimize_
 from stratum.optimizer.logical._projection_ops import ApplyUDFOp
 from stratum.optimizer.physical._impl_selection import bind_op
 from stratum.optimizer.physical._plan_context import PlanContext
@@ -241,6 +242,15 @@ class TestOpProcess(unittest.TestCase):
         result = op.process("fit_transform", [{"x": 42}, "x"])
         self.assertEqual(result, 42)
 
+    def test_getitem_with_placeholder_nested_in_tuple_key(self):
+        # A two-axis indexer (`frame.loc[mask, cols]`) carries a *tuple* key, so the
+        # ref to substitute sits one level inside it rather than being the key itself.
+        df = pd.DataFrame({"x": [1, 2, 3], "y": [4, 5, 6]})
+        op = GetItemOp(key=(OperandRef(1), ["x"]))
+        bind_op(op, PlanContext.from_flags())
+        result = op.process("fit_transform", [df.loc, df["x"] > 1])
+        pd.testing.assert_frame_equal(df.loc[df["x"] > 1, ["x"]], result)
+
     def test_binop_both_placeholders(self):
         op = BinOp(op=operator.add, left=OperandRef(0), right=OperandRef(1))
         result = op.process("fit_transform", [10, 20])
@@ -315,6 +325,64 @@ class TestOperandBinder(unittest.TestCase):
         self.assertEqual(binder.ref_op(op0), OperandRef(0))
         self.assertEqual(binder.ref_op(op1), OperandRef(1))
         self.assertEqual(binder.ref_op(op0), OperandRef(0))  # dedup by identity
+
+
+class TestTwoAxisIndexerConversion(unittest.TestCase):
+    """`as_op` binds every DataOp a GetItem key holds, however deeply it is nested.
+
+    `frame.loc[mask, cols]` hands skrub a *tuple* key: the row mask is a DataOp one
+    level down. Binding it only when the key *was itself* a DataOp left the mask with
+    no consumer, so its sub-DAG stayed listed in its producers' outputs while being
+    unreachable from the root -- and the topological walk refuses to walk that.
+    """
+
+    def setUp(self):
+        self.df = pd.DataFrame({"x": [1, 2, 3], "y": [4, 5, 6]})
+
+    def _two_axis_getitem(self, root):
+        found = [op for op in topological_iterator(root)
+                 if isinstance(op, GetItemOp) and isinstance(op.key, tuple)]
+        self.assertEqual(1, len(found), "expected exactly one two-axis GetItemOp")
+        return found[0]
+
+    def test_row_mask_is_bound_as_an_operand(self):
+        data = st.as_data_op(self.df)
+        root = convert_to_ops(data.loc[data["x"] > 1, ["x"]])
+
+        getitem = self._two_axis_getitem(root)
+        # inputs[0] is the `.loc` accessor, inputs[1] the mask the key refers to.
+        self.assertEqual((OperandRef(1), ["x"]), getitem.key)
+        self.assertEqual(2, len(getitem.inputs))
+        self.assertIsInstance(getitem.inputs[1], BinOp)
+        validate_dag(root)
+
+    def test_conversion_leaves_no_op_outside_the_dag(self):
+        # The regression: the mask's own `df["x"]` stayed in the source's outputs
+        # while nothing consumed it, which is what `topological_iterator` trips over.
+        data = st.as_data_op(self.df)
+        root = convert_to_ops(data.loc[data["x"] > 1, ["x"]])
+        reachable = list(topological_iterator(root))  # raises on a dangling op
+        self.assertEqual(len(reachable), len(set(map(id, reachable))))
+
+    def test_both_axes_can_be_graph_fed(self):
+        # Nothing in the key is privileged: a mask on each axis binds to its own input.
+        data = st.as_data_op(self.df)
+        root = convert_to_ops(data.loc[data["x"] > 1, data.columns != "y"])
+
+        getitem = self._two_axis_getitem(root)
+        self.assertEqual((OperandRef(1), OperandRef(2)), getitem.key)
+        self.assertEqual(3, len(getitem.inputs))
+        validate_dag(root)
+
+    def test_single_key_binding_is_unchanged(self):
+        # The plain one-axis form keeps binding the key as a bare ref, not a tuple.
+        data = st.as_data_op(self.df)
+        root = convert_to_ops(data[data["x"] > 1])
+
+        found = [op for op in topological_iterator(root)
+                 if isinstance(op, GetItemOp) and isinstance(op.key, OperandRef)]
+        self.assertEqual(1, len(found))
+        self.assertEqual(OperandRef(1), found[0].key)
 
 
 class TestEdgeDedup(unittest.TestCase):

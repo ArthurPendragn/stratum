@@ -47,6 +47,24 @@ class ConcatOp(Op):
         self.output_type = OutputType.FRAME
 
 
+# The accessors whose ``[...]`` takes one indexer per axis, so a tuple key is a
+# (rows, columns) pair rather than a single (MultiIndex) label.
+_ROW_COL_ACCESSORS = ("loc", "iloc")
+
+
+def _is_row_col_indexer(op: GetItemOp) -> bool:
+    """Whether ``op`` indexes through ``.loc``/``.iloc``, i.e. one axis per key element.
+
+    The accessor survives extraction as the ``GetAttrProjectionOp`` feeding this
+    GetItem, so the container tells the two tuple-key meanings apart: ``df.loc[a, b]``
+    indexes rows by ``a`` and columns by ``b``, while a bare ``df[("a", "b")]`` is one
+    MultiIndex column label.
+    """
+    container = op.inputs[0]
+    return (isinstance(container, GetAttrProjectionOp) and bool(container.attr_name)
+            and container.attr_name[-1] in _ROW_COL_ACCESSORS)
+
+
 def _getitem_output_type(op: GetItemOp) -> OutputType:
     """Infer the output type of a ``GetItemOp`` whose container is frame-like.
 
@@ -54,6 +72,10 @@ def _getitem_output_type(op: GetItemOp) -> OutputType:
     single column -> SERIES; ``df[["a", "b"]]`` selects a sub-frame -> FRAME;
     ``df[mask]`` / ``df[label_series]`` (a graph-fed key, i.e. an
     :class:`OperandRef`) or a slice selects rows -> FRAME.
+
+    A two-axis ``df.loc[rows, cols]`` / ``df.iloc[rows, cols]`` restricts rows *and*
+    columns, so its column indexer decides the kind: a single label or position
+    extracts one column -> SERIES; a list, slice or mask keeps a frame -> FRAME.
     """
     container = op.inputs[0]
     if container.output_type is OutputType.SERIES:
@@ -61,6 +83,9 @@ def _getitem_output_type(op: GetItemOp) -> OutputType:
     # container is a FRAME (the only other frame-like type reaching here).
     if isinstance(op.key, str):
         return OutputType.SERIES
+    if isinstance(op.key, tuple) and len(op.key) == 2 and _is_row_col_indexer(op):
+        return (OutputType.SERIES if isinstance(op.key[1], (str, int))
+                else OutputType.FRAME)
     # list/tuple of columns, an OperandRef mask, or a slice -> FRAME.
     return OutputType.FRAME
 

@@ -111,3 +111,38 @@ class TestOutputTypeInference(unittest.TestCase):
         ops = optimize(data["x"] + data["y"],
                        OptConfig(dataframe_ops=True, numeric_ops=False))
         self.assertIs(OutputType.SERIES, self._one(ops, BinOp).output_type)
+
+    def test_two_axis_loc_with_a_column_list_is_frame(self):
+        # `df.loc[mask, ["x"]]` restricts rows *and* columns; a column list keeps a
+        # frame, exactly as the one-axis `df[["x"]]` does.
+        data = st.as_data_op(self.df)
+        ops = optimize(data.loc[data["x"] > 1, ["x"]], OptConfig(dataframe_ops=True))
+        self.assertIs(OutputType.FRAME, self._one(ops, GetItemOp).output_type)
+
+    def test_two_axis_loc_with_a_single_column_is_series(self):
+        # `df.loc[mask, "y"]` extracts one column, so the column indexer -- not the
+        # tuple-ness of the key -- decides: SERIES, not the FRAME above.
+        data = st.as_data_op(self.df)
+        ops = optimize(data.loc[data["x"] > 1, "y"], OptConfig(dataframe_ops=True))
+        self.assertIs(OutputType.SERIES, self._one(ops, GetItemOp).output_type)
+
+    def test_two_axis_iloc_with_a_single_position_is_series(self):
+        # `.iloc` indexes the same two axes by position: one position is one column.
+        data = st.as_data_op(self.df)
+        ops = optimize(data.iloc[0:2, 0], OptConfig(dataframe_ops=True))
+        self.assertIs(OutputType.SERIES, self._one(ops, GetItemOp).output_type)
+
+    def test_two_axis_iloc_with_a_position_list_is_frame(self):
+        data = st.as_data_op(self.df)
+        ops = optimize(data.iloc[0:2, [0]], OptConfig(dataframe_ops=True))
+        self.assertIs(OutputType.FRAME, self._one(ops, GetItemOp).output_type)
+
+    def test_the_two_axis_rule_does_not_reach_a_plain_getitem(self):
+        # A tuple key means "one indexer per axis" only under `.loc`/`.iloc`. On a
+        # plain `df[...]` it is a single MultiIndex label, so the second element is
+        # not a column indexer and must not be read as one. MultiIndex labels are
+        # otherwise unhandled: this pins the untouched default, not a correct kind
+        # (pandas returns a SERIES here).
+        df = pd.DataFrame({("a", "x"): [1, 2], ("a", "y"): [3, 4]})
+        ops = optimize(st.as_data_op(df)[("a", "x")], OptConfig(dataframe_ops=True))
+        self.assertIs(OutputType.FRAME, self._one(ops, GetItemOp).output_type)
