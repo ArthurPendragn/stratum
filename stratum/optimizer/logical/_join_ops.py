@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 from stratum.optimizer.logical._ops import OperandRef, OutputType, MethodCallOp, Op
+from stratum.optimizer.logical import _schema
 
 
 class JoinOp(Op):
@@ -27,6 +28,60 @@ class JoinOp(Op):
         self.right_index = right_index
         self.suffixes = suffixes
         self.output_type = OutputType.FRAME
+
+    def propagate_output_schema(self):
+        """Merge the two sides; `how` is part of the schema, since a null-padded
+        side loses its integer dtypes. See :func:`_schema.join_schema`."""
+        left = self.inputs[0].output_schema
+        right = self.inputs[1].output_schema
+        if not _schema.is_known(left) or not _schema.is_known(right):
+            self.output_schema = None
+            return
+        self.output_schema = _schema.join_schema(
+            left, right, self._collapsed_keys(left, right), self.suffixes, self.how)
+
+    def _collapsed_keys(self, left, right):
+        """The key names that merge folds into a single output column.
+
+        pandas pairs `left_on`/`right_on` *positionally* and collapses a pair only
+        when its two names are equal; a pair of differing names keeps both columns
+        (and suffixes them if they clash with the other side). So this is a
+        positional walk, not a set intersection -- `left_on=["a","b"]` against
+        `right_on=["b","a"]` shares both names yet collapses neither, and pandas
+        emits `a_x, b_x, a_y, b_y`.
+
+        With no key arguments at all, a bare `merge()` infers the keys as the two
+        frames' common columns, and those do collapse.
+
+        Returns `None` when the keys can't be worked out statically, which makes
+        the whole schema unknown rather than a confidently wrong column set.
+        """
+        # A cross join matches every row pair and takes no keys, so nothing
+        # collapses and every shared name is suffixed.
+        if self.how == "cross":
+            return set()
+
+        if self.left_on is None and self.right_on is None:
+            # An index-to-index join has no key *columns*; the index is not part
+            # of the schema, so every shared column name is simply suffixed.
+            if self.left_index or self.right_index:
+                return set()
+            # Bare merge(): pandas infers the keys from the common columns.
+            return set(left) & set(right)
+
+        # Mixing one side's key column with the other side's index makes pandas
+        # emit an extra key column (`left_on="k", right_index=True` on two frames
+        # that both hold `k` yields `k, k_x, k_y`). Not worth modelling.
+        if self.left_on is None or self.right_on is None:
+            return None
+        if self.left_index or self.right_index:
+            return None
+
+        left_on = _schema.as_column_list(self.left_on)
+        right_on = _schema.as_column_list(self.right_on)
+        if left_on is None or right_on is None or len(left_on) != len(right_on):
+            return None
+        return {lhs for lhs, rhs in zip(left_on, right_on) if lhs == rhs}
 
 
 _MERGE_POSITIONAL = ["how", "on", "left_on", "right_on",

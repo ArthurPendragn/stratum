@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import polars as pl
 
+from stratum.optimizer.logical import _schema
 from stratum.optimizer.logical._base import OutputType
 from stratum.optimizer.logical._ops import FITTING_MODE, Op, OperandRef
 from stratum.optimizer.logical._scoring import Metric, read_response
@@ -99,6 +100,22 @@ class ScoreCandidatesOp(CandidateSetOp):
         self.emit_predictions = emit_predictions
         self.output_type = OutputType.FRAME
         self.y_ref: OperandRef | None = None
+
+    def propagate_output_schema(self):
+        """The scored table is built column by column in ``process``: one row per
+        candidate, holding its name and the metric's value, plus the raw values
+        when ``emit_predictions``.
+
+        This describes the scoring pass. The fitting pass produces nothing at all
+        (``process`` returns ``None`` there, since a fold is scored on the fold it
+        was not fitted on), so there is no second schema to reconcile.
+        """
+        # candidate_names are strings and Metric returns a float; the values are
+        # whatever the candidate produced (array / frame / series), so untyped.
+        schema = {"id": pl.String, "scores": pl.Float64}
+        if self.emit_predictions:
+            schema["vals"] = _schema.UNKNOWN_DTYPE
+        self.output_schema = pl.Schema(schema)
 
     def clone(self):
         new_op = type(self)(self.candidate_names, self.metric,

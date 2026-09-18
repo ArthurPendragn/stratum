@@ -1,7 +1,12 @@
 from stratum.optimizer.logical._ops import OperandRef, Op, OutputType, ValueOp, VariableOp, CallOp
+from stratum.optimizer.logical import _schema
 from pandas import DataFrame
 import numpy as np
 import pandas as pd
+import polars as pl
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class DataSourceOp(Op):
@@ -29,6 +34,43 @@ class DataSourceOp(Op):
         # A directly-passed DataFrame or a csv read is a FRAME; np.load yields an
         # ndarray, so an npy source is a MATRIX.
         self.output_type = OutputType.MATRIX if _format == "npy" else OutputType.FRAME
+
+    def propagate_output_schema(self):
+        """Read from the in-memory frame, or the file header; unknown when the
+        names can't be read statically (graph-fed path, non-csv format)."""
+        if self.data is not None:
+            self.output_schema = _schema.schema_of_frame(self.data)
+        elif isinstance(self.file_path, OperandRef) or self.format != "csv":
+            self.output_schema = None
+        else:
+            self.output_schema = self._csv_header_schema()
+
+    def _csv_header_schema(self):
+        """Column names from the CSV header (``nrows=0``), dtypes left Unknown.
+
+        Must pass this op's own ``read_args``/``read_kwargs``: several of them
+        (``sep``, ``header``, ``names``, ``usecols``, ``index_col``, ...) change the
+        resulting column set, so ignoring them would yield a confidently wrong
+        schema rather than an unknown one. That is also why the probe is pandas and
+        not ``pl.read_csv`` -- polars renames every one of those options and has no
+        ``index_col`` at all, so translating would silently drift.
+
+        Names are not necessarily strings (``header=None`` yields integer labels);
+        the ``_schema`` helpers already fall back to unknown on those.
+        """
+        read_args = tuple(self.read_args or ())
+        read_kwargs = dict(self.read_kwargs or {})
+        # A graph-fed option is still an OperandRef at plan time, so its value --
+        # and with it the column set -- isn't knowable here.
+        if any(isinstance(v, OperandRef) for v in (*read_args, *read_kwargs.values())):
+            return None
+        read_kwargs.pop("nrows", None)
+        try:
+            names = pd.read_csv(self.file_path, *read_args, nrows=0, **read_kwargs).columns
+        except Exception:
+            logger.debug("Could not derive schema for %s; falling back to unknown.", self.file_path)
+            return None
+        return pl.Schema({name: _schema.UNKNOWN_DTYPE for name in names})
 
     def clone(self):
         raise ValueError(f"We should not clone DataSourceOp objects.")

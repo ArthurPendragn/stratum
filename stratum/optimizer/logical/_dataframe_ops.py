@@ -3,6 +3,7 @@ from stratum.optimizer.logical._ops import (OperandRef, OutputType, is_frame_lik
 from pandas import DataFrame
 from polars import DataFrame as PolarsDataFrame
 from skrub import SelectCols
+from stratum.optimizer.logical import _schema
 import pandas as pd
 import numpy as np
 
@@ -23,6 +24,8 @@ from stratum.optimizer.logical._projection_ops import (
     make_datetime_conversion_op, make_frame_get_attr, make_string_method_op,
     resolve_selector_columns)
 from stratum.optimizer.logical._map_ops import MapOp, AssignMapOp, make_assign_map_op
+from stratum.optimizer.logical._column_methods import (
+    ColumnMethodOp, is_supported_column_method, make_column_method_op)
 from stratum.optimizer.logical._join_ops import (
     JoinOp, _MERGE_POSITIONAL, _JOIN_POSITIONAL, _JOIN_OP_FIELDS, make_join_op,
     _make_chained_join_op)
@@ -45,6 +48,27 @@ class ConcatOp(Op):
         self.others = list(others)
         self.axis = axis
         self.output_type = OutputType.FRAME
+
+    def propagate_output_schema(self):
+        """See :func:`_schema.concat_schemas` for the per-axis rules.
+
+        The operands are ``first``/``others``, *not* ``self.inputs``: a literal
+        frame operand is stored inline rather than as an input edge, so reading
+        ``inputs`` would silently omit its columns."""
+        if isinstance(self.axis, OperandRef):
+            # The axis picks the dtype rule, so a graph-fed axis is unknown.
+            self.output_schema = None
+            return
+        operands = [self.first, *self.others]
+        self.output_schema = _schema.concat_schemas(
+            [self._operand_schema(o) for o in operands], self.axis)
+
+    def _operand_schema(self, operand):
+        """Schema of one concat operand: a graph-fed op's propagated schema, or
+        the schema of an inline constant frame."""
+        if isinstance(operand, OperandRef):
+            return self.inputs[operand.k].output_schema
+        return _schema.schema_of_frame(operand)
 
 
 # The accessors whose ``[...]`` takes one indexer per axis, so a tuple key is a
@@ -139,6 +163,8 @@ def extract_dataframe_op(op: Op, root: Op, selection_op = True, map_op = True,
                 # enclosing `df[...]` then sees a mask and folds the chain into a
                 # StrExpr predicate, matching the StringMethodOp directly.
                 new_op = make_string_method_op(op)
+            elif is_supported_column_method(op):
+                new_op = make_column_method_op(op)
             elif op.method_name == "groupby":
                 # Leave groupby as-is; mark it as a dataframe op so the following
                 # aggregation call is visited and can fuse with it.

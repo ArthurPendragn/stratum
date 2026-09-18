@@ -43,10 +43,15 @@ def lowering_rule(*op_types):
 def install_lowered(old: Op, new: PhysicalOp, root: IRNode) -> IRNode:
     """Splice ``new`` into the DAG in place of the logical op ``old``.
 
-    Copies ``old``'s edges and X/y/type metadata onto ``new`` (unless the rule
-    already set a specific ``output_type``) and rewires every neighbour, so the
-    physical node occupies exactly the logical node's position. Returns the new
-    root when ``old`` was the root, else ``root`` unchanged.
+    Copies ``old``'s edges and X/y/type/schema metadata onto ``new`` (unless the
+    rule already set a specific ``output_type``/``output_schema``) and rewires every
+    neighbour, so the physical node occupies exactly the logical node's position.
+    Returns the new root when ``old`` was the root, else ``root`` unchanged.
+
+    Carrying ``output_schema`` matters only for the families a lowering rule
+    rebuilds from scratch (today: the source and transformer ops). Everything else
+    goes through implementation selection, which rebinds ``op.__class__`` in place
+    and so keeps the ``__dict__``, schema included.
     """
     new.inputs = old.inputs
     new.outputs = old.outputs
@@ -54,6 +59,8 @@ def install_lowered(old: Op, new: PhysicalOp, root: IRNode) -> IRNode:
     new.is_y = old.is_y
     if new.output_type is OutputType.UNKNOWN:
         new.output_type = old.output_type
+    if new.output_schema is None:
+        new.output_schema = old.output_schema
     for in_ in new.inputs:
         in_.replace_output(old, new)
     for out_ in new.outputs:

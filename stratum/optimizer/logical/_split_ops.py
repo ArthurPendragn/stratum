@@ -36,6 +36,14 @@ class SplitOutput(Op):
         self.is_x = is_x
         self.output_type = OutputType.FRAME
 
+    def propagate_output_schema(self):
+        # Subsetting rows keeps the columns. The SplitOp itself is an (X, y)
+        # fan-out with no schema of its own, so read past it to the matching input
+        # (inputs[0] = X, inputs[1] = y, per add_splitting_op).
+        split_op = self.inputs[0]
+        src = split_op.inputs[0 if self.is_x else 1]
+        self.output_schema = src.output_schema
+
     def process(self, mode: str, inputs: list):
         if self.is_x:
             return inputs[0][0]

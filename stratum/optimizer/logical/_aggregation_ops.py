@@ -1,4 +1,5 @@
 from stratum.optimizer.logical._ops import OperandRef, OutputType, MethodCallOp, Op
+from stratum.optimizer.logical import _schema
 
 
 class AggregateOp(Op):
@@ -29,6 +30,15 @@ class AggregateOp(Op):
         self.aggregations = aggregations
         self.groupby_kwargs = groupby_kwargs or {}
         self.output_type = OutputType.FRAME
+
+    def propagate_output_schema(self):
+        """See :func:`_schema.aggregate_schema` for which specs are knowable."""
+        self.output_schema = _schema.aggregate_schema(
+            self.inputs[0].output_schema,
+            self.grouping_attributes,
+            self.aggregations,
+            self.groupby_kwargs.get("as_index"),
+        )
 
 
 class GroupedDataframeOp(Op):

@@ -9,8 +9,10 @@ from skrub._data_ops._choosing import BaseChoice, Choice, Match
 from skrub._data_ops._data_ops import DataOp, Apply, Value, CallMethod, Call, GetAttr, GetItem, BinOp as SkrubBinOp, UnaryOp as SkrubUnaryOp, Concat, Var, _wrap_estimator
 from skrub._utils import PassThrough
 from pandas import DataFrame
+import polars as pl
 from polars import DataFrame as PlDataFrame, Series as PlSeries
 from stratum.frontend._skrub_graph import _collect_child_data_ops
+from stratum.optimizer.logical import _schema
 # Shared IR foundation. Re-exported below so existing ``from ..._ops import X``
 # call sites (OutputType, OperandRef, is_frame_like, config_key, ...) keep working.
 from stratum.optimizer.logical._base import (
@@ -577,6 +579,40 @@ class GetAttrOp(Op):
         else:
             return getattr(inputs[0], self.attr_name)
 
+def _elementwise_schema(op: "Op", operands) -> "pl.Schema | None":
+    """Output schema of an elementwise ``BinOp``/``UnaryOp`` over frame data.
+
+    Keeps the frame operand's column set; the dtypes come from
+    ``_schema.elementwise_result_dtype``. Unknown when the op doesn't produce
+    frame data, when any frame operand is unknown, or -- for a frame-frame op --
+    when the operands don't carry the same columns, since pandas aligns on column
+    labels and unions them rather than keeping one side's.
+
+    ``operands`` is the op's operand fields (e.g. ``(left, right)``), used only to
+    tell whether *every* operand is a frame-like graph input, which decides
+    whether a per-column dtype list can be assembled at all.
+    """
+    if op.output_type not in FRAME_TYPES:
+        return None
+    frame_inputs = [in_op for in_op in op.inputs if is_frame_like(in_op)]
+    frame_schemas = [in_op.output_schema for in_op in frame_inputs]
+    if not frame_schemas or any(s is None for s in frame_schemas):
+        return None
+    first = frame_schemas[0]
+    if any(list(s.keys()) != list(first.keys()) for s in frame_schemas[1:]):
+        return None
+    # A constant or non-frame operand contributes a dtype we don't know, so we
+    # can't assemble a complete per-column dtype list for it.
+    all_operands_are_frames = (
+        len(frame_inputs) == len(operands)
+        and all(isinstance(o, OperandRef) for o in operands))
+    return pl.Schema({
+        name: _schema.elementwise_result_dtype(
+            op.op, [s[name] for s in frame_schemas] if all_operands_are_frames else None)
+        for name in first
+    })
+
+
 class GetItemOp(Op):
     fields = ["key", "is_filter"]
     
@@ -587,6 +623,25 @@ class GetItemOp(Op):
         if name is None:
             name = str(key)
         super().__init__(name=name)
+
+    def propagate_output_schema(self):
+        """A literal key projects a sub-schema; a row slice or a boolean row mask
+        keeps the input schema."""
+        schema = self.inputs[0].output_schema
+        if isinstance(self.key, slice):
+            self.output_schema = schema  # row slice keeps all columns
+        elif isinstance(self.key, OperandRef):
+            # A graph-fed key has no static value, so classify by the producing
+            # op's kind: SERIES means a boolean row mask (`df[df["x"] > 0]`) and
+            # keeps the schema, anything else is an unresolvable column selector.
+            # HEURISTIC: a SERIES of column *labels* is column projection too, and
+            # is misclassified here, but that idiom doesn't occur in supported
+            # pipelines.
+            key_op = self.inputs[self.key.k]
+            self.output_schema = schema if key_op.output_type is OutputType.SERIES else None
+        else:
+            self.output_schema = _schema.project_columns(schema, self.key)
+
     # Execution lives in the physical impls (physical/_getitem_execs.py).
 
 class BinOp(Op):
@@ -599,6 +654,12 @@ class BinOp(Op):
         self.left = left
         self.right = right
 
+
+    def propagate_output_schema(self):
+        """An elementwise op (``df + 1``, ``df["x"] > 0``) keeps its frame
+        operand's columns and re-derives the dtypes; see
+        :func:`_elementwise_schema`."""
+        self.output_schema = _elementwise_schema(self, (self.left, self.right))
 
     def process(self, mode: str, inputs: list):
         left = inputs[self.left.k] if isinstance(self.left, OperandRef) else self.left
@@ -613,6 +674,10 @@ class UnaryOp(Op):
         self.op = op
         # operand is an OperandRef when graph-fed, otherwise a constant.
         self.operand = operand
+
+    def propagate_output_schema(self):
+        """As :class:`BinOp`, for the unary case (``~mask``, ``-df``, ``abs(df)``)."""
+        self.output_schema = _elementwise_schema(self, (self.operand,))
 
     def process(self, mode: str, inputs: list):
         operand = inputs[self.operand.k] if isinstance(self.operand, OperandRef) else self.operand
