@@ -11,6 +11,9 @@ pub(crate) struct ExactSplitFinder {
     min_samples_leaf: usize,
     min_weight_leaf: f64,
     sorted: Vec<(f32, usize)>,
+    left_counts: Vec<f64>,
+    right_counts: Vec<f64>,
+    missing_counts: Vec<f64>,
 }
 
 impl ExactSplitFinder {
@@ -29,6 +32,9 @@ impl ExactSplitFinder {
             min_samples_leaf,
             min_weight_leaf,
             sorted: Vec::new(),
+            left_counts: Vec::new(),
+            right_counts: Vec::new(),
+            missing_counts: Vec::new(),
         }
     }
 }
@@ -74,12 +80,19 @@ impl SplitFinder for ExactSplitFinder {
                 .extend(rows.iter().map(|&row| (x[row * n_features + feature], row)));
             self.sorted.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
 
-            // Reject non-finite values early so the tree only trains on finite inputs.
-            if self.sorted.iter().any(|(value, _)| !value.is_finite()) {
-                return Err("exact finite split finder received a non-finite feature value".into());
+            let finite_end = self.sorted.partition_point(|(value, _)| !value.is_nan());
+            if self.sorted[..finite_end]
+                .iter()
+                .any(|(value, _)| value.is_infinite())
+            {
+                return Err("exact split finder received an infinite feature value".into());
             }
             // Constant features are remembered and skipped in future search rounds.
-            if self.sorted.last().unwrap().0 <= self.sorted[0].0 + FEATURE_THRESHOLD {
+            if finite_end == 0
+                || (finite_end == self.sorted.len()
+                    && self.sorted[finite_end - 1].0
+                        <= self.sorted[0].0 + FEATURE_THRESHOLD)
+            {
                 self.features.swap(f_j, n_total_constants);
                 n_found += 1;
                 n_total_constants += 1;
@@ -88,57 +101,121 @@ impl SplitFinder for ExactSplitFinder {
 
             f_i -= 1;
             self.features.swap(f_i, f_j);
-            let mut left_counts = vec![0.0; n_classes];
-            let mut right_counts = parent.class_weights.clone();
+            self.left_counts.resize(n_classes, 0.0);
+            self.left_counts.fill(0.0);
+            self.right_counts.clone_from(&parent.class_weights);
+            self.missing_counts.resize(n_classes, 0.0);
+            self.missing_counts.fill(0.0);
+            let n_missing = self.sorted.len() - finite_end;
+            let mut missing_weight = 0.0;
+            for &(_, row) in &self.sorted[finite_end..] {
+                self.missing_counts[y[row]] += weights[row];
+                missing_weight += weights[row];
+            }
             let mut left_weight = 0.0;
             let mut right_weight = parent.weight;
             let mut p = 0usize;
 
             // Sweep candidate thresholds across groups of equal feature values.
-            while p < self.sorted.len() {
+            while p < finite_end {
                 let p_prev = p;
                 p += 1;
-                while p < self.sorted.len()
+                while p < finite_end
                     && self.sorted[p].0 <= self.sorted[p - 1].0 + FEATURE_THRESHOLD
                 {
                     p += 1;
                 }
                 for &(_, row) in &self.sorted[p_prev..p] {
                     let weight = weights[row];
-                    left_counts[y[row]] += weight;
-                    right_counts[y[row]] -= weight;
+                    self.left_counts[y[row]] += weight;
+                    self.right_counts[y[row]] -= weight;
                     left_weight += weight;
                     right_weight -= weight;
                 }
-                if p == self.sorted.len()
-                    || p < self.min_samples_leaf
-                    || self.sorted.len() - p < self.min_samples_leaf
-                    || left_weight < self.min_weight_leaf
-                    || right_weight < self.min_weight_leaf
-                {
+                if p == finite_end {
                     continue;
                 }
-                // Match sklearn's proxy score and tie behavior rather than a
-                // numerically equivalent but differently rounded formula.
-                let left_impurity = gini(&left_counts, left_weight);
-                let right_impurity = gini(&right_counts, right_weight);
-                let proxy = -left_weight * left_impurity - right_weight * right_impurity;
+
+                // Missing-right is evaluated first so strict ties route right.
+                for missing_left in [false, true] {
+                    if n_missing == 0 && missing_left {
+                        continue;
+                    }
+                    let n_left = p + usize::from(missing_left) * n_missing;
+                    let n_right = self.sorted.len() - n_left;
+                    let candidate_left_weight =
+                        left_weight + if missing_left { missing_weight } else { 0.0 };
+                    let candidate_right_weight =
+                        right_weight - if missing_left { missing_weight } else { 0.0 };
+                    if n_left < self.min_samples_leaf
+                        || n_right < self.min_samples_leaf
+                        || candidate_left_weight < self.min_weight_leaf
+                        || candidate_right_weight < self.min_weight_leaf
+                    {
+                        continue;
+                    }
+                    if missing_left {
+                        for class in 0..n_classes {
+                            self.left_counts[class] += self.missing_counts[class];
+                            self.right_counts[class] -= self.missing_counts[class];
+                        }
+                    }
+                    let left_impurity = gini(&self.left_counts, candidate_left_weight);
+                    let right_impurity = gini(&self.right_counts, candidate_right_weight);
+                    let proxy = -candidate_left_weight * left_impurity
+                        - candidate_right_weight * right_impurity;
+                    if proxy > best_proxy {
+                        best_proxy = proxy;
+                        let lower = self.sorted[p - 1].0 as f64;
+                        let upper = self.sorted[p].0 as f64;
+                        let mut threshold = lower / 2.0 + upper / 2.0;
+                        if threshold == upper || threshold.is_infinite() {
+                            threshold = lower;
+                        }
+                        let improvement = parent.impurity
+                            - candidate_left_weight / parent.weight * left_impurity
+                            - candidate_right_weight / parent.weight * right_impurity;
+                        best = Some(Split {
+                            feature,
+                            threshold,
+                            missing_go_to_left: if n_missing == 0 {
+                                p > self.sorted.len() - p
+                            } else {
+                                missing_left
+                            },
+                            improvement,
+                            left_impurity,
+                            right_impurity,
+                        });
+                    }
+                    if missing_left {
+                        for class in 0..n_classes {
+                            self.left_counts[class] -= self.missing_counts[class];
+                            self.right_counts[class] += self.missing_counts[class];
+                        }
+                    }
+                }
+            }
+
+            // Also consider the finite-versus-missing split represented by +inf.
+            if n_missing > 0
+                && finite_end >= self.min_samples_leaf
+                && n_missing >= self.min_samples_leaf
+                && left_weight >= self.min_weight_leaf
+                && missing_weight >= self.min_weight_leaf
+            {
+                let left_impurity = gini(&self.left_counts, left_weight);
+                let right_impurity = gini(&self.missing_counts, missing_weight);
+                let proxy = -left_weight * left_impurity - missing_weight * right_impurity;
                 if proxy > best_proxy {
                     best_proxy = proxy;
-                    // Place the threshold between adjacent sorted feature values.
-                    let lower = self.sorted[p - 1].0 as f64;
-                    let upper = self.sorted[p].0 as f64;
-                    let mut threshold = lower / 2.0 + upper / 2.0;
-                    if threshold == upper || threshold.is_infinite() {
-                        threshold = lower;
-                    }
                     let improvement = parent.impurity
                         - left_weight / parent.weight * left_impurity
-                        - right_weight / parent.weight * right_impurity;
+                        - missing_weight / parent.weight * right_impurity;
                     best = Some(Split {
                         feature,
-                        threshold,
-                        missing_go_to_left: p > self.sorted.len() - p,
+                        threshold: f64::INFINITY,
+                        missing_go_to_left: false,
                         improvement,
                         left_impurity,
                         right_impurity,

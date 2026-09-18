@@ -1,5 +1,7 @@
 use super::exact::gini;
 use super::model::{TreeModel, TREE_LEAF};
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 const EPSILON: f64 = f64::EPSILON;
 
@@ -44,6 +46,7 @@ pub(crate) trait SplitFinder {
 }
 
 // Hyperparameters and basic shape constraints for tree construction.
+#[derive(Clone, Copy)]
 pub(crate) struct BuildParams {
     pub(crate) n_features: usize,
     pub(crate) n_classes: usize,
@@ -51,6 +54,7 @@ pub(crate) struct BuildParams {
     pub(crate) min_samples_split: usize,
     pub(crate) min_samples_leaf: usize,
     pub(crate) min_impurity_decrease: f64,
+    pub(crate) max_leaf_nodes: Option<usize>,
 }
 
 // Temporary mutable storage used while assembling the final `TreeModel`.
@@ -124,6 +128,18 @@ pub(crate) fn build_tree<F: SplitFinder>(
         return Err("at least one positive-weight row is required".into());
     }
     let total_weight: f64 = rows.iter().map(|&row| weights[row]).sum();
+    if let Some(max_leaf_nodes) = params.max_leaf_nodes {
+        return build_tree_best_first(
+            x,
+            y,
+            weights,
+            params,
+            finder,
+            rows,
+            total_weight,
+            max_leaf_nodes,
+        );
+    }
 
     // The stack stores the active row intervals that still need processing.
     let mut tree = MutableTree::new(params.n_features);
@@ -187,12 +203,18 @@ pub(crate) fn build_tree<F: SplitFinder>(
             continue;
         }
 
-        // Partition the active rows in-place (memory-efficient) so both child slices stay contiguous.
+        // Partition the active rows in-place so both child slices stay contiguous.
         let mut boundary = frame.start;
         let mut right = frame.end;
         while boundary < right {
             let row = rows[boundary];
-            if x[row * params.n_features + split.feature] as f64 <= split.threshold {
+            let value = x[row * params.n_features + split.feature];
+            let goes_left = if value.is_nan() {
+                split.missing_go_to_left
+            } else {
+                value as f64 <= split.threshold
+            };
+            if goes_left {
                 boundary += 1;
             } else {
                 right -= 1;
@@ -207,7 +229,6 @@ pub(crate) fn build_tree<F: SplitFinder>(
         tree.feature[node] = split.feature as i64;
         tree.threshold[node] = split.threshold;
         tree.missing_left[node] = split.missing_go_to_left;
-        tree.importances[split.feature] += stats.weight * split.improvement;
 
         // Push right first so the left subtree is built next. This preserves
         // sklearn's depth-first RNG consumption and preorder node numbering.
@@ -228,18 +249,8 @@ pub(crate) fn build_tree<F: SplitFinder>(
         let _ = (split.left_impurity, split.right_impurity);
     }
 
-    // Normalize feature importances to sum to one when there was any gain.
-    if total_weight > 0.0 {
-        let sum: f64 = tree.importances.iter().sum();
-        if sum > 0.0 {
-            for value in &mut tree.importances {
-                *value /= sum;
-            }
-        }
-    }
-
     // Materialize the immutable model and validate its internal consistency.
-    let model = TreeModel {
+    let mut model = TreeModel {
         children_left: tree.left,
         children_right: tree.right,
         feature: tree.feature,
@@ -255,8 +266,244 @@ pub(crate) fn build_tree<F: SplitFinder>(
         n_leaves: tree.n_leaves,
         feature_importances: tree.importances,
     };
+    compute_feature_importances(&mut model);
     model.validate()?;
     Ok(model)
+}
+
+// A prepared best-first frontier node. Ordering intentionally compares only
+// improvement, matching sklearn's heap contract for equal-gain candidates.
+struct FrontierNode {
+    node: usize,
+    start: usize,
+    end: usize,
+    depth: usize,
+    stats: NodeStats,
+    split: Split,
+    child_constants: Vec<usize>,
+}
+
+impl PartialEq for FrontierNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.split.improvement == other.split.improvement
+    }
+}
+
+impl Eq for FrontierNode {}
+
+impl PartialOrd for FrontierNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.split.improvement.partial_cmp(&other.split.improvement)
+    }
+}
+
+impl Ord for FrontierNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+    }
+}
+
+// Evaluate a node at creation time so feature RNG consumption matches the
+// best-first sklearn builder, including candidates that never get expanded.
+#[allow(clippy::too_many_arguments)]
+fn prepare_frontier_node<F: SplitFinder>(
+    x: &[f32],
+    y: &[usize],
+    weights: &[f64],
+    params: BuildParams,
+    finder: &mut F,
+    rows: &[usize],
+    start: usize,
+    end: usize,
+    depth: usize,
+    node: usize,
+    stats: NodeStats,
+    constants: &[usize],
+    total_weight: f64,
+) -> Result<Option<FrontierNode>, String> {
+    if depth >= params.max_depth
+        || end - start < params.min_samples_split
+        || end - start < 2 * params.min_samples_leaf
+        || stats.impurity <= 0.0
+    {
+        return Ok(None);
+    }
+    let search = finder.best_split(
+        x,
+        params.n_features,
+        &rows[start..end],
+        y,
+        weights,
+        params.n_classes,
+        &stats,
+        constants,
+    )?;
+    let Some(split) = search.split else {
+        return Ok(None);
+    };
+    let weighted_improvement = stats.weight / total_weight * split.improvement;
+    if weighted_improvement + EPSILON < params.min_impurity_decrease {
+        return Ok(None);
+    }
+    Ok(Some(FrontierNode {
+        node,
+        start,
+        end,
+        depth,
+        stats,
+        split: Split {
+            improvement: weighted_improvement,
+            ..split
+        },
+        child_constants: search.constants,
+    }))
+}
+
+// Build a max-leaf-limited tree by globally expanding the best frontier node.
+#[allow(clippy::too_many_arguments)]
+fn build_tree_best_first<F: SplitFinder>(
+    x: &[f32],
+    y: &[usize],
+    weights: &[f64],
+    params: BuildParams,
+    finder: &mut F,
+    mut rows: Vec<usize>,
+    total_weight: f64,
+    max_leaf_nodes: usize,
+) -> Result<TreeModel, String> {
+    let mut tree = MutableTree::new(params.n_features);
+    let root_stats = node_stats(&rows, y, weights, params.n_classes);
+    let root = tree.add_node(&root_stats, rows.len(), params.n_classes);
+    let mut frontier = BinaryHeap::new();
+    if let Some(candidate) = prepare_frontier_node(
+        x,
+        y,
+        weights,
+        params,
+        finder,
+        &rows,
+        0,
+        rows.len(),
+        0,
+        root,
+        root_stats,
+        &[],
+        total_weight,
+    )? {
+        frontier.push(candidate);
+    }
+    let mut n_leaves = 1usize;
+
+    while n_leaves < max_leaf_nodes {
+        let Some(candidate) = frontier.pop() else {
+            break;
+        };
+        let split = &candidate.split;
+        let mut boundary = candidate.start;
+        let mut right = candidate.end;
+        while boundary < right {
+            let row = rows[boundary];
+            let value = x[row * params.n_features + split.feature];
+            let goes_left = if value.is_nan() {
+                split.missing_go_to_left
+            } else {
+                value as f64 <= split.threshold
+            };
+            if goes_left {
+                boundary += 1;
+            } else {
+                right -= 1;
+                rows.swap(boundary, right);
+            }
+        }
+        if boundary == candidate.start || boundary == candidate.end {
+            return Err("split produced an empty child".into());
+        }
+
+        tree.feature[candidate.node] = split.feature as i64;
+        tree.threshold[candidate.node] = split.threshold;
+        tree.missing_left[candidate.node] = split.missing_go_to_left;
+
+        // Children are allocated and evaluated left-to-right before either is
+        // queued, preserving sklearn's node numbering and splitter RNG order.
+        for (start, end, is_left) in [
+            (candidate.start, boundary, true),
+            (boundary, candidate.end, false),
+        ] {
+            let stats = node_stats(&rows[start..end], y, weights, params.n_classes);
+            let child = tree.add_node(&stats, end - start, params.n_classes);
+            if is_left {
+                tree.left[candidate.node] = child as i64;
+            } else {
+                tree.right[candidate.node] = child as i64;
+            }
+            let depth = candidate.depth + 1;
+            tree.max_depth = tree.max_depth.max(depth);
+            if let Some(next) = prepare_frontier_node(
+                x,
+                y,
+                weights,
+                params,
+                finder,
+                &rows,
+                start,
+                end,
+                depth,
+                child,
+                stats,
+                &candidate.child_constants,
+                total_weight,
+            )? {
+                frontier.push(next);
+            }
+        }
+        n_leaves += 1;
+        let _ = (&candidate.stats, split.left_impurity, split.right_impurity);
+    }
+
+    tree.n_leaves = n_leaves;
+    let mut model = TreeModel {
+        children_left: tree.left,
+        children_right: tree.right,
+        feature: tree.feature,
+        threshold: tree.threshold,
+        missing_go_to_left: tree.missing_left,
+        impurity: tree.impurity,
+        n_node_samples: tree.n_samples,
+        weighted_n_node_samples: tree.weighted_samples,
+        values: tree.values,
+        n_classes: params.n_classes,
+        n_features: params.n_features,
+        max_depth: tree.max_depth,
+        n_leaves: tree.n_leaves,
+        feature_importances: tree.importances,
+    };
+    compute_feature_importances(&mut model);
+    model.validate()?;
+    Ok(model)
+}
+
+// Derive importances from finalized child statistics, matching sklearn's
+// fitted-tree calculation and avoiding split-search rounding artifacts.
+fn compute_feature_importances(model: &mut TreeModel) {
+    model.feature_importances.fill(0.0);
+    for node in 0..model.children_left.len() {
+        if model.children_left[node] == TREE_LEAF {
+            continue;
+        }
+        let left = model.children_left[node] as usize;
+        let right = model.children_right[node] as usize;
+        model.feature_importances[model.feature[node] as usize] +=
+            model.weighted_n_node_samples[node] * model.impurity[node]
+                - model.weighted_n_node_samples[left] * model.impurity[left]
+                - model.weighted_n_node_samples[right] * model.impurity[right];
+    }
+    let sum: f64 = model.feature_importances.iter().sum();
+    if sum > 0.0 {
+        for value in &mut model.feature_importances {
+            *value /= sum;
+        }
+    }
 }
 
 // A stack frame describing one contiguous slice of active rows.
@@ -329,6 +576,7 @@ mod tests {
                 min_samples_split: 2,
                 min_samples_leaf: 1,
                 min_impurity_decrease: 0.0,
+                max_leaf_nodes: None,
             },
             &mut finder,
         )

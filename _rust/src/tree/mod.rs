@@ -1,6 +1,7 @@
 // Tree construction, split search, model storage, and RNG helpers.
 mod builder;
 mod exact;
+mod forest;
 mod model;
 mod rng;
 
@@ -13,6 +14,7 @@ use pyo3::prelude::*;
 use builder::{build_tree, BuildParams};
 use exact::ExactSplitFinder;
 
+pub(crate) use forest::{forest_fit_exact, forest_model_info, forest_predict, ForestModelHandle};
 pub(crate) use model::{tree_model_arrays, tree_model_from_arrays, tree_predict, TreeModelHandle};
 
 // Fit the exact finite-value decision tree from dense float32 features.
@@ -29,6 +31,7 @@ pub(crate) fn tree_fit_exact(
     max_features: usize,
     min_impurity_decrease: f64,
     tree_seed: u32,
+    max_leaf_nodes: Option<usize>,
 ) -> PyResult<Py<TreeModelHandle>> {
     let shape = x.shape();
     let n_rows = shape[0];
@@ -61,6 +64,7 @@ pub(crate) fn tree_fit_exact(
                     min_samples_split,
                     min_samples_leaf,
                     min_impurity_decrease,
+                    max_leaf_nodes,
                 },
                 &mut finder,
             )
