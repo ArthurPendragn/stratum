@@ -18,6 +18,7 @@ import polars as pl
 from stratum.optimizer.logical._column_expr import (ColumnExpr, Const, EvalContext,
                                                _Folder)
 from stratum.optimizer.logical._ops import (MethodCallOp, Op, OperandRef, OutputType)
+from stratum.optimizer.logical import _schema
 
 
 class MapOp(Op):
@@ -45,6 +46,13 @@ class AssignMapOp(MapOp):
         super().__init__(name=f"assign: {', '.join(entries)}",
                          inputs=inputs, outputs=outputs)
         self.entries = entries
+
+    def propagate_output_schema(self):
+        """`df.assign(...)` folded to a map: the entry names are added/overwritten
+        and the source columns pass through. An entry's dtype depends on its
+        expression, so it is recorded as Unknown."""
+        self.output_schema = _schema.add_columns(self.inputs[0].output_schema,
+                                                list(self.entries))
 
 
 # --- Folding: assign subgraphs -> MapOp ---------------------------------------

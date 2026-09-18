@@ -57,6 +57,12 @@ class SelectionOp(Op):
         # stays a series); extraction overrides this with the propagated type.
         self.output_type = OutputType.FRAME
 
+    def propagate_output_schema(self):
+        """A selection restricts rows and keeps columns, so it passes its source
+        frame's schema through unchanged -- for every kind (a MASK/QUERY predicate
+        and the method-based kinds alike only ever drop rows)."""
+        self.output_schema = self.inputs[0].output_schema
+
     # No custom __str__: the base IRNode renders ``<class>(<name>) [df]`` from
     # ``self.name`` (== the kind). While logical, it shows the ``Selection``
     # family; once lowered, ``_is_physical`` flips the class-name component to the

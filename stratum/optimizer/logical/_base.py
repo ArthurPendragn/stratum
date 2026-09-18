@@ -225,6 +225,9 @@ class IRNode:
         self.is_X = is_X
         self.is_y = is_y
         self.output_type = OutputType.UNKNOWN
+        # Derived output schema (a polars.Schema, or None for "unknown"), filled in
+        # by the schema-propagation pass. See ir/_schema.py and Op.propagate_output_schema.
+        self.output_schema = None
         self.is_split_op = False
         self.was_cloned = False
         self.remove_after: list[IRNode] = []
