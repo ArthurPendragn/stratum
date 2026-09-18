@@ -1,4 +1,8 @@
 use anyhow::Result;
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+use pyo3::types::{PyAny, PyIterator};
 use rayon::prelude::*;
 use crate::{tokenize, hashing};
 use crate::csr::CsrParts;
@@ -6,6 +10,13 @@ use numpy::ndarray::Array1;
 use ahash::AHasher;
 use ahash::AHashMap as HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+
+/// Python-owned fitted TF-IDF state.
+#[pyclass(name = "_TfidfModelHandle", frozen)]
+pub(crate) struct TfidfModelHandle {
+    model: Arc<TfidfModel>,
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -351,7 +362,7 @@ impl VocabBuilder {
         let mut per_doc: Vec<HashMap<i32, u32>> = Vec::with_capacity(n_docs);
 
         // Parallel tokenize + per-doc token counts (by token string)
-        let t0 = crate::util::start_timing();
+        let t0 = crate::timing::start_timing();
         let per_doc_tokens: Vec<HashMap<String, u32>> = docs
             .par_iter()
             .map(|s| {
@@ -406,7 +417,7 @@ impl VocabBuilder {
             }
             per_doc.push(counts);
         }
-        crate::util::print_timing("tfidf tokenize and DF update", t0);
+        crate::timing::print_timing("tfidf tokenize and DF update", t0);
 
         // Compute IDF
         let n_cols = df.len();
@@ -422,7 +433,7 @@ impl VocabBuilder {
         let mut csr = CsrParts::with_capacity(n_docs, 0);
         let mut nnz_cum = 0i64;
 
-        let t0 = crate::util::start_timing();
+        let t0 = crate::timing::start_timing();
         for doc_map in per_doc.into_iter() {
             let mut items: Vec<(i32, u32)> = doc_map.into_iter().collect();
             //items.sort_by_key(|&(k, _)| k);
@@ -447,7 +458,7 @@ impl VocabBuilder {
             nnz_cum += (row_end - row_start) as i64;
             csr.indptr.push(nnz_cum);
         }
-        crate::util::print_timing("tfidf build CSR output", t0);
+        crate::timing::print_timing("tfidf build CSR output", t0);
 
         let model = TfidfModel {
             analyzer: self.analyzer,
@@ -483,3 +494,185 @@ fn get_or_insert_col_owned(vocab: &mut HashMap<String, i32>, df: &mut Vec<u32>, 
     col
 }
 
+// Simple mapping from domain error to PyErr
+fn to_pyerr(err: Error) -> PyErr {
+    use Error::*;
+    let msg = match err {
+        InvalidAnalyzer => "Invalid analyzer".to_string(),
+        InvalidNgramRange => "Invalid ngram_range".to_string(),
+        Internal => "Internal error".to_string()
+    };
+    PyErr::new::<PyValueError, _>(msg)
+}
+
+#[pyfunction]
+#[pyo3(signature = (seq, analyzer, ngram_min, ngram_max, n_features))]
+pub(crate) fn hashing_tfidf_csr(
+    py: Python<'_>,
+    seq: Bound<PyAny>,    //iterable of strings (empty for nulls)
+    analyzer: &str, //"char"/"char_wb"
+    ngram_min: usize, ngram_max: usize, n_features: usize
+) -> PyResult<(
+    Py<PyArray1<f32>>,  //data
+    Py<PyArray1<i32>>,  //indices
+    Py<PyArray1<i64>>,  //indptr
+    usize,              //n_rows
+    usize,              //n_cols (n_features)
+    Py<PyArray1<f32>>   //idf (length of n_features)
+)> {
+    // Collect input into a vector. TODO: zero-copy
+    let mut docs: Vec<String> = Vec::new();
+    let iter = PyIterator::from_object(&seq)?;
+    for item in iter {
+        let obj = item?;
+        // Treat none as empty string. Python pre-fill should already do this.
+        let s: String = if obj.is_none() {String::new()} else {obj.extract()?};
+        docs.push(s);
+    }
+    let n_rows = docs.len();
+
+    // Work buffers to be produced by tfidf::build_csr
+    // Compute-intensive work without the GIL. TODO: multi-threading.
+    let (data, indices, indptr, idf) = py.detach(|| {
+        let builder = Builder::new(analyzer, ngram_min, ngram_max, n_features)?;
+        let out = builder.build_csr(&docs); //(data, indices, indptr, idf)
+        out
+    }).map_err(to_pyerr)?;
+
+    // Convert to NumPy without copying where possible. from_vec is zero-copy but from_array is not.
+    let py_data = PyArray1::<f32>::from_vec(py, data).to_owned();
+    let py_indices = PyArray1::<i32>::from_vec(py, indices).to_owned();
+    let py_indptr = PyArray1::<i64>::from_vec(py, indptr).to_owned();
+    let py_idf = idf.into_pyarray(py).to_owned();
+
+    Ok((Py::from(py_data), Py::from(py_indices), Py::from(py_indptr), n_rows, n_features, Py::from(py_idf)))
+
+}
+
+#[pyfunction]
+#[pyo3(signature = (seq, analyzer, ngram_min, ngram_max, n_features, idf))]
+pub(crate) fn hashing_tfidf_csr_with_idf(
+    py: Python<'_>,
+    seq: Bound<PyAny>,    //iterable of strings (empty for nulls)
+    analyzer: &str, //"char"/"char_wb"
+    ngram_min: usize, ngram_max: usize, n_features: usize,
+    idf: PyReadonlyArray1<f32>  //pre-computed IDF vector
+) -> PyResult<(
+    Py<PyArray1<f32>>,  //data
+    Py<PyArray1<i32>>,  //indices
+    Py<PyArray1<i64>>,  //indptr
+    usize,              //n_rows
+    usize,              //n_cols (n_features)
+)> {
+    // Collect input into a vector. TODO: zero-copy
+    let mut docs: Vec<String> = Vec::new();
+    let iter = PyIterator::from_object(&seq)?;
+    for item in iter {
+        let obj = item?;
+        // Treat none as empty string. Python pre-fill should already do this.
+        let s: String = if obj.is_none() {String::new()} else {obj.extract()?};
+        docs.push(s);
+    }
+    let n_rows = docs.len();
+
+    // Get IDF slice (zero-copy read)
+    let idf_slice = idf.as_slice()?;
+    if idf_slice.len() != n_features {
+        return Err(PyErr::new::<PyValueError, _>(
+            format!("IDF length {} does not match n_features {}", idf_slice.len(), n_features)
+        ));
+    }
+
+    // Work buffers to be produced by tfidf::build_csr_with_idf
+    // Compute-intensive work without the GIL.
+    let (data, indices, indptr) = py.detach(|| {
+        let builder = Builder::new(analyzer, ngram_min, ngram_max, n_features)?;
+        let out = builder.build_csr_with_idf(&docs, idf_slice);
+        out
+    }).map_err(to_pyerr)?;
+
+    // Convert to NumPy without copying where possible. from_vec is zero-copy but from_array is not.
+    let py_data = PyArray1::<f32>::from_vec(py, data).to_owned();
+    let py_indices = PyArray1::<i32>::from_vec(py, indices).to_owned();
+    let py_indptr = PyArray1::<i64>::from_vec(py, indptr).to_owned();
+
+    Ok((Py::from(py_data), Py::from(py_indices), Py::from(py_indptr), n_rows, n_features))
+
+}
+
+// ---- Fit TF-IDF vocabulary + return CSR ----
+#[pyfunction]
+#[pyo3(signature = (seq, analyzer, ngram_min, ngram_max))]
+pub(crate) fn tfidf_fit_csr(
+    py: Python<'_>,
+    seq: Vec<String>, //Fixme: reference (&PyList) instead of copying
+    analyzer: &str,
+    ngram_min: usize,
+    ngram_max: usize,
+) -> PyResult<(
+    Py<TfidfModelHandle>, // Python-owned fitted model
+    Py<PyArray1<f32>>, // data
+    Py<PyArray1<i32>>, // indices
+    Py<PyArray1<i64>>, // indptr
+    usize,             // n_rows
+    usize,             // n_cols (vocab size)
+)> {
+    let docs = seq;
+    let n_rows = docs.len();
+
+    let (model, data, indices, indptr) = py
+        .detach(|| {
+            let builder = VocabBuilder::new(analyzer, ngram_min, ngram_max)?;
+            builder.fit_csr(&docs)
+        })
+        .map_err(to_pyerr)?;
+
+    let n_cols = model.n_cols;
+    let model = Py::new(
+        py,
+        TfidfModelHandle {
+            model: Arc::new(model),
+        },
+    )?;
+
+    // Convert to NumPy (Vec -> NumPy is zero-copy for from_vec)
+    let py_data = PyArray1::<f32>::from_vec(py, data).to_owned();
+    let py_indices = PyArray1::<i32>::from_vec(py, indices).to_owned();
+    let py_indptr = PyArray1::<i64>::from_vec(py, indptr).to_owned();
+
+    Ok((model, Py::from(py_data), Py::from(py_indices), Py::from(py_indptr), n_rows, n_cols))
+}
+
+// ---- Transform using Python-owned vocab/idf + return CSR ----
+#[pyfunction]
+#[pyo3(signature = (model_id, seq))]
+pub(crate) fn tfidf_transform_csr(
+    py: Python<'_>,
+    model_id: PyRef<'_, TfidfModelHandle>,
+    seq: Vec<String>,
+) -> PyResult<(
+    Py<PyArray1<f32>>, // data
+    Py<PyArray1<i32>>, // indices
+    Py<PyArray1<i64>>, // indptr
+    usize,             // n_rows
+    usize,             // n_cols
+)> {
+    let docs = seq;
+    let n_rows = docs.len();
+
+    // Clone only the Arc before releasing the GIL. Concurrent transforms share
+    // the immutable fitted vocabulary and IDF without cloning their contents.
+    let model = Arc::clone(&model_id.model);
+    let n_cols = model.n_cols;
+    drop(model_id);
+
+    let (data, indices, indptr) = py
+        .detach(|| model.transform_csr(&docs))
+        .map_err(to_pyerr)?;
+
+    let py_data = PyArray1::<f32>::from_vec(py, data).to_owned();
+    let py_indices = PyArray1::<i32>::from_vec(py, indices).to_owned();
+    let py_indptr = PyArray1::<i64>::from_vec(py, indptr).to_owned();
+
+    Ok((Py::from(py_data), Py::from(py_indices), Py::from(py_indptr), n_rows, n_cols))
+}

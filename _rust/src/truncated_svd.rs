@@ -17,12 +17,27 @@
 //  Compare ndarry::linalg (blas-backed) with faer
 
 use ndarray::{Array2, Axis};
-use pyo3::{exceptions::PyValueError, PyErr};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods};
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use rayon::ThreadPool;
+use std::sync::Arc;
 
 use faer::{Mat, Side};
+
+use crate::threads::get_thread_pool;
+
+/// Python-owned fitted randomized-TSVD state.
+#[pyclass(name = "_TruncatedSvdModelHandle", frozen)]
+pub(crate) struct TruncatedSvdModel {
+    n_cols: usize,
+    k: usize,
+    // components_t is (n_cols × k)
+    components_t: Arc<Array2<f32>>,
+    singular_values: Vec<f32>,
+}
 
 fn csr_validate(
     data: &[f32],
@@ -299,12 +314,12 @@ pub fn truncated_svd_csr(
     }
 
     // Build CSC once for X^T @ Q and for final Gram.
-    let t0 = crate::util::start_timing();
+    let t0 = crate::timing::start_timing();
     let (data_t, rows_t, col_ptr) = csr_to_csc(data, indices, indptr, n_rows, n_cols);
-    crate::util::print_timing("build CSC transpose", t0);
+    crate::timing::print_timing("build CSC transpose", t0);
 
     // Step 1: Gaussian omega (n_cols × l), column-major.
-    let t0 = crate::util::start_timing();
+    let t0 = crate::timing::start_timing();
     let s = seed.unwrap_or(0xC0FFEE);
     let mut rng = StdRng::seed_from_u64(s);
     let mut omega = Vec::<f32>::with_capacity(n_cols * l);
@@ -325,30 +340,30 @@ pub fn truncated_svd_csr(
         };
         omega.push(val);
     }
-    crate::util::print_timing("generate random matrix", t0);
+    crate::timing::print_timing("generate random matrix", t0);
 
     // Step 2: Y = X @ Ω (n_rows × l)
-    let t0 = crate::util::start_timing();
+    let t0 = crate::timing::start_timing();
     let y = csr_matmul_dense_colmajor(data, indices, indptr, n_rows, n_cols, &omega, l, pool_ref);
-    crate::util::print_timing("compute Y = X @ Ω", t0);
+    crate::timing::print_timing("compute Y = X @ Ω", t0);
 
     // Step 3: QR(Y) -> Q (n_rows × l)
-    let t0 = crate::util::start_timing();
+    let t0 = crate::timing::start_timing();
     let mut q_current = thin_q_from(&y)?;
-    crate::util::print_timing("QR decomposition (faer)", t0);
+    crate::timing::print_timing("QR decomposition (faer)", t0);
 
     // Step 4: Power iterations
     // Efficiently compute B = X^T @ Q using CSC (column-parallel).
     for iter in 0..n_iter {
-        let t0 = crate::util::start_timing();
+        let t0 = crate::timing::start_timing();
         let b = csc_transpose_matmul_dense(&data_t, &rows_t, &col_ptr, n_cols, &q_current, l, pool_ref);
-        crate::util::print_timing(&format!("power iter {}: B = X^T @ Q", iter + 1), t0);
+        crate::timing::print_timing(&format!("power iter {}: B = X^T @ Q", iter + 1), t0);
 
-        let t0 = crate::util::start_timing();
+        let t0 = crate::timing::start_timing();
         let q_b = thin_q_from(&b)?; // (n_cols × l)
-        crate::util::print_timing(&format!("power iter {}: QR(B) (faer)", iter + 1), t0);
+        crate::timing::print_timing(&format!("power iter {}: QR(B) (faer)", iter + 1), t0);
 
-        let t0 = crate::util::start_timing();
+        let t0 = crate::timing::start_timing();
         // Y_new = X @ Q_b (n_rows × l)
         // Q_b is stored row-major in ndarray, but our kernel expects "dense right matrix" in col-major,
         // so we transpose into a column-major buffer once.
@@ -359,19 +374,19 @@ pub fn truncated_svd_csr(
             }
         }
         let y_new = csr_matmul_dense_colmajor(data, indices, indptr, n_rows, n_cols, &qb_colmaj, l, pool_ref);
-        crate::util::print_timing(&format!("power iter {}: Y = X @ Q_b", iter + 1), t0);
+        crate::timing::print_timing(&format!("power iter {}: Y = X @ Q_b", iter + 1), t0);
 
-        let t0 = crate::util::start_timing();
+        let t0 = crate::timing::start_timing();
         q_current = thin_q_from(&y_new)?; // (n_rows × l)
-        crate::util::print_timing(&format!("power iter {}: QR(Y) (faer)", iter + 1), t0);
+        crate::timing::print_timing(&format!("power iter {}: QR(Y) (faer)", iter + 1), t0);
     }
 
     // Step 5: Compute B_t = X^T @ Q (n_cols × l) using CSC, then Gram G = B_t^T B_t (l×l).
-    let t0 = crate::util::start_timing();
+    let t0 = crate::timing::start_timing();
     let b_t = csc_transpose_matmul_dense(&data_t, &rows_t, &col_ptr, n_cols, &q_current, l, pool_ref);
-    crate::util::print_timing("B_t = X^T @ Q", t0);
+    crate::timing::print_timing("B_t = X^T @ Q", t0);
 
-    let t0 = crate::util::start_timing();
+    let t0 = crate::timing::start_timing();
     let mut g = Array2::<f32>::zeros((l, l));
     // G[a,b] = sum_j B_t[j,a] * B_t[j,b]
     // Parallelize over rows j of B_t. Each worker accumulates local G and reduce.
@@ -393,12 +408,12 @@ pub fn truncated_svd_csr(
         )
     };
     g = match pool_ref { Some(pool) => pool.install(build_g), None => build_g() };
-    crate::util::print_timing("Gram G = B_t^T B_t", t0);
+    crate::timing::print_timing("Gram G = B_t^T B_t", t0);
 
     // Eigen on small G.
-    let t0 = crate::util::start_timing();
+    let t0 = crate::timing::start_timing();
     let (eigvals_asc, u_g) = self_adjoint_eigen(&g)?; // ascending
-    crate::util::print_timing("eigendecomp(G) (faer)", t0);
+    crate::timing::print_timing("eigendecomp(G) (faer)", t0);
 
     // Take top-k (largest eigenvalues) => last k in ascending order.
     let want_k = k.min(l).min(n_rows);
@@ -406,7 +421,7 @@ pub fn truncated_svd_csr(
         return Err(PyErr::new::<PyValueError, _>("k is 0 after bounds check"));
     }
 
-    let t0 = crate::util::start_timing();
+    let t0 = crate::timing::start_timing();
     let mut u_trunc = Array2::<f32>::zeros((l, want_k));
     let mut s_trunc = vec![0.0f32; want_k];
 
@@ -433,9 +448,9 @@ pub fn truncated_svd_csr(
             }
         }
     }
-    crate::util::print_timing("final Z = Q U sqrt(Λ)", t0);
+    crate::timing::print_timing("final Z = Q U sqrt(Λ)", t0);
 
-    let t0 = crate::util::start_timing();
+    let t0 = crate::timing::start_timing();
     let mut components_t = Array2::<f32>::zeros((n_cols, want_k));
     ndarray::linalg::general_mat_mul(1.0, &b_t, &u_trunc, 0.0, &mut components_t);
 
@@ -451,7 +466,7 @@ pub fn truncated_svd_csr(
             // If s==0, keep that column as zeros (safe)
         }
     }
-    crate::util::print_timing("compute components_t = V", t0);
+    crate::timing::print_timing("compute components_t = V", t0);
 
     Ok((z, components_t, s_trunc))
 }
@@ -539,4 +554,108 @@ pub fn truncated_svd_transform_csr(
     }
 
     Ok(z)
+}
+
+fn compute_truncated_svd_fit(data: &[f32], indices: &[i32], indptr: &[i64],
+    n_rows: usize, n_cols: usize, k: usize, seed: Option<u64>) -> Result<(TruncatedSvdModel, Array2<f32>), PyErr>
+{
+    // Hardcoded sklearn defaults: n_iter = 5 or 7, oversample=10
+    const N_ITER: usize = 5;
+    const OVERSAMPLE: usize = 10;
+    let pool = get_thread_pool();
+
+    let (z, components_t, s) = truncated_svd_csr(
+        data, indices, indptr,
+        n_rows, n_cols,
+        k, N_ITER, OVERSAMPLE,
+        seed,
+        pool,
+    )?;
+
+    let model = TruncatedSvdModel {
+        n_cols,
+        k: components_t.ncols(),
+        components_t: Arc::new(components_t),
+        singular_values: s,
+    };
+
+    Ok((model, z))
+}
+
+#[pyfunction]
+#[pyo3(signature = (data, indices, indptr, n_rows, n_cols, k, seed=None))]
+pub(crate) fn truncated_svd_fit_from_csr(py: Python<'_>, data: Bound<PyArray1<f32>>, indices: Bound<PyArray1<i32>>,
+    indptr: Bound<PyArray1<i64>>, n_rows: usize, n_cols: usize, k: usize,
+    seed: Option<u64>) -> PyResult<(Py<TruncatedSvdModel>, Py<PyArray2<f32>>)>
+{
+    // Step 1: Zero-copy view of NumPy arrays
+    let data = unsafe { data.as_slice()? };
+    let indices = unsafe { indices.as_slice()? };
+    let indptr = unsafe { indptr.as_slice()? };
+
+    let (model, z) = py.detach(||
+        compute_truncated_svd_fit(data, indices, indptr, n_rows, n_cols, k, seed))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("truncated_svd_fit failed: {e}")))?;
+
+    // Step 2: Return Python-owned state and NumPy output (zero-copy).
+    let model = Py::new(py, model)?;
+    let py_z = z.into_pyarray(py).to_owned();
+    Ok((model, Py::from(py_z)))
+}
+
+fn compute_truncated_svd_transform(
+    components_t: Arc<Array2<f32>>,
+    model_n_cols: usize,
+    data: &[f32],
+    indices: &[i32],
+    indptr: &[i64],
+    n_rows: usize,
+    n_cols: usize,
+) -> Result<Array2<f32>, PyErr> {
+    // Validate cols match
+    if n_cols != model_n_cols {
+        return Err(PyErr::new::<PyValueError, _>(format!(
+            "n_cols mismatch: input n_cols={} but model expects {}",
+            n_cols, model_n_cols
+        )));
+    }
+
+    let pool = get_thread_pool();
+    truncated_svd_transform_csr(data, indices, indptr, n_rows, n_cols, &components_t, pool)
+}
+
+#[pyfunction]
+#[pyo3(signature = (model_id, data, indices, indptr, n_rows, n_cols))]
+pub(crate) fn truncated_svd_transform_from_csr(
+    py: Python<'_>,
+    model_id: PyRef<'_, TruncatedSvdModel>,
+    data: Bound<PyArray1<f32>>,
+    indices: Bound<PyArray1<i32>>,
+    indptr: Bound<PyArray1<i64>>,
+    n_rows: usize,
+    n_cols: usize,
+) -> PyResult<Py<PyArray2<f32>>> {
+    let data = unsafe { data.as_slice()? };
+    let indices = unsafe { indices.as_slice()? };
+    let indptr = unsafe { indptr.as_slice()? };
+    let components_t = Arc::clone(&model_id.components_t);
+    let model_n_cols = model_id.n_cols;
+    drop(model_id);
+
+    let z = py
+        .detach(|| {
+            compute_truncated_svd_transform(
+                components_t,
+                model_n_cols,
+                data,
+                indices,
+                indptr,
+                n_rows,
+                n_cols,
+            )
+        })
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("truncated_svd_transform failed: {e}")))?;
+
+    let py_z = z.into_pyarray(py).to_owned();
+    Ok(Py::from(py_z))
 }

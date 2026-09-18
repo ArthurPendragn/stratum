@@ -1,37 +1,89 @@
 import pandas as pd
 from skrub import DataOp
+from skrub._data_ops._data_ops import SplitX
+from skrub._data_ops._estimator import _Splitter
+# Aliased: this module defines its own `evaluate` for the train/test path.
+from skrub._data_ops._evaluation import evaluate as skrub_evaluate
+from skrub._data_ops._evaluation import needs_eval
+from sklearn.model_selection import check_cv
 
 from stratum._config import FLAGS
-from stratum.optimizer._optimize import optimize
+from stratum.optimizer._optimize import SearchConfig, optimize
+from stratum.optimizer.logical._scoring import resolve_scoring
 from stratum.runtime._scheduler import SequentialScheduler
+from stratum.frontend._skrub_graph import find_x_impl, get_data
 from time import perf_counter
 
 #TODO: Rename this file
 def grid_search(dag: DataOp, cv=None, scoring=None, return_predictions=False, env=None):
-    """Perform grid search with cross-validation on a DataOp DAG."""
+    """Perform grid search with cross-validation on a DataOp DAG. ``scoring`` is required."""
+    if scoring is None:
+        # A search ranks a set, so every candidate has to be measured the same way.
+        # `.skb.make_grid_search()` still honours scoring=None, by handing the call to
+        # skrub. See docs/adr/0004-a-search-always-names-its-metric.md.
+        raise ValueError(
+            "grid_search requires scoring=. Without it each candidate would be scored by"
+            " its own estimator's `score`, so a batch mixing estimator kinds would rank"
+            " an accuracy against an R². Pass a string naming an sklearn metric, a scorer"
+            " built with `make_scorer`, or a callable `scorer(estimator, X, y)`."
+        )
     t0 = perf_counter()
     #FIXME: Measure operator execution only if stats is enabled
     env_extra = env if env else {}
-    env = dag.skb.get_data()
+    env = get_data(dag)
     for k, v in env_extra.items():
         env[k] = v
+    cv = _resolve_cv(dag, cv, env)
+    # The scorer is plan-time state: it decides what the plan's last operator computes,
+    # and an unusable `scoring=` fails here rather than after a fold has been fitted.
+    search = SearchConfig(metric=resolve_scoring(scoring),
+                          return_predictions=return_predictions)
     # Resolve variables to constants at compile time, so the scheduler runs
     # without an environment.
-    linearized_dag, split_pos, flagged_ops = optimize(dag, env=env)
+    linearized_dag, split_pos, flagged_ops = optimize(dag, env=env, search=search)
     sched = SequentialScheduler(linearized_dag, split_pos, flagged_ops, FLAGS.stats, t0=t0)
 
-    preds = sched.grid_search(cv, scoring, return_predictions)
+    preds = sched.grid_search(cv)
 
     stats_printer(sched)
 
     return (sched,preds) if return_predictions else sched
 
 
+def _resolve_cv(dag: DataOp, cv, env: dict):
+    """Resolve the splitter to cross-validate with.
+
+    Mirrors skrub's ``_compute_cv_data``: an explicit ``cv`` is prioritized, otherwise the
+    splitter declared on the plan via ``mark_as_X(cv=..., split_kwargs=...)``
+    determines the folds.
+
+    The declared splitter is wrapped in skrub's ``_Splitter`` so ``split_kwargs``
+    (e.g. ``groups`` for ``GroupKFold``) reach it. ``split_kwargs`` defaults to
+    None when only ``cv`` is passed, hence the normalization to an empty dict.
+    """
+    if cv is not None:
+        return cv
+    impl = find_x_impl(dag)
+    if not isinstance(impl, SplitX) or impl.cv is None:
+        return None
+    declared_cv, split_kwargs = impl.cv, impl.split_kwargs
+    if needs_eval((declared_cv, split_kwargs)):
+        # Both may themselves be DataOps, which only the environment can resolve.
+        resolved = skrub_evaluate(
+            {"cv": declared_cv, "split_kwargs": split_kwargs},
+            mode="fit_transform",
+            environment=env,
+            clear=True,
+        )
+        declared_cv, split_kwargs = resolved["cv"], resolved["split_kwargs"]
+    return _Splitter(check_cv(declared_cv), split_kwargs or {})
+
+
 def evaluate(dag: DataOp, seed: int = 42, test_size = 0.2):
     """Evaluate a DataOp DAG with train/test split."""
     # Resolve variables to constants at compile time, so the scheduler runs
     # without an environment.
-    linearized_dag, split_pos, flagged_ops = optimize(dag, env=dag.skb.get_data())
+    linearized_dag, split_pos, flagged_ops = optimize(dag, env=get_data(dag))
     sched = SequentialScheduler(linearized_dag, split_pos, flagged_ops, FLAGS.stats)
     out = sched.evaluate(seed, test_size)
     stats_printer(sched)

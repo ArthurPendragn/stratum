@@ -1,6 +1,19 @@
+use once_cell::sync::Lazy;
 use std::sync::OnceLock;
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use crate::util::get_num_threads;
+
+// Thread-safe check on the first use
+static NUM_THREADS: Lazy<usize> = Lazy::new(|| {
+    match std::env::var("SKRUB_RUST_THREADS") {
+        Ok(num) => num.parse().unwrap_or(0),
+        _ => 0,
+    }
+});
+
+#[inline]
+fn get_num_threads() -> usize {
+    *NUM_THREADS
+}
 
 // Thread-safe one time creation of thread pool
 static POOL: OnceLock<Option<ThreadPool>> = OnceLock::new();
