@@ -58,10 +58,29 @@ class SelectionOp(Op):
         self.output_type = OutputType.FRAME
 
     def propagate_output_schema(self):
-        """A selection restricts rows and keeps columns, so it passes its source
-        frame's schema through unchanged -- for every kind (a MASK/QUERY predicate
-        and the method-based kinds alike only ever drop rows)."""
-        self.output_schema = self.inputs[0].output_schema
+        """A selection restricts rows and keeps columns, so the source schema
+        passes through unchanged, for a MASK/QUERY predicate and the method-based
+        kinds alike.
+
+        The one exception is ``dropna(axis=1)``, which drops the *columns* that
+        contain nulls. Which ones those are is value-dependent, so it is unknown
+        rather than a different set of names.
+        """
+        if self.kind is SelectionKind.DROPNA and not self._drops_rows():
+            self.output_schema = None
+            return
+        # A selection with no source edge has nothing to pass through.
+        self.output_schema = self.inputs[0].output_schema if self.inputs else None
+
+    def _drops_rows(self) -> bool:
+        """Whether a DROPNA works down the rows (``axis=0``), pandas' default.
+
+        ``dropna`` takes keyword arguments only, so ``args`` cannot carry the axis.
+        A graph-fed axis has no static value and is treated as column-wise, the
+        conservative side.
+        """
+        axis = (self.kwargs or {}).get("axis", 0)
+        return axis in (0, "index")
 
     # No custom __str__: the base IRNode renders ``<class>(<name>) [df]`` from
     # ``self.name`` (== the kind). While logical, it shows the ``Selection``

@@ -48,9 +48,8 @@ class AssignMapOp(MapOp):
         self.entries = entries
 
     def propagate_output_schema(self):
-        """`df.assign(...)` folded to a map: the entry names are added/overwritten
-        and the source columns pass through. An entry's dtype depends on its
-        expression, so it is recorded as Unknown."""
+        """``df.assign(...)`` folded to a map: adds/overwrites the entry names,
+        Unknown-typed, and passes the source columns through."""
         self.output_schema = _schema.add_columns(self.inputs[0].output_schema,
                                                 list(self.entries))
 

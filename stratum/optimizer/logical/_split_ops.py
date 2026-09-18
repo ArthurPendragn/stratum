@@ -15,12 +15,6 @@ class SplitOp(Op):
         self.output_type = OutputType.FRAME
         self.indices = None
 
-    def propagate_output_schema(self):
-        """A split is a structural ``(X, y)`` fan-out, not a single frame: it has
-        no schema of its own. The consuming :class:`SplitOutput`s read their
-        schema from this op's inputs directly."""
-        self.output_schema = None
-
     def process(self, mode: str, inputs: list):
         # we need to handle both pandas and polars dfs
         x = inputs[0]
@@ -43,8 +37,9 @@ class SplitOutput(Op):
         self.output_type = OutputType.FRAME
 
     def propagate_output_schema(self):
-        # Subsetting rows keeps the columns: take the schema of the matching
-        # SplitOp input (inputs[0] = X, inputs[1] = y, per add_splitting_op).
+        # Subsetting rows keeps the columns. The SplitOp itself is an (X, y)
+        # fan-out with no schema of its own, so read past it to the matching input
+        # (inputs[0] = X, inputs[1] = y, per add_splitting_op).
         split_op = self.inputs[0]
         src = split_op.inputs[0 if self.is_x else 1]
         self.output_schema = src.output_schema

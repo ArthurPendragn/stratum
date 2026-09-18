@@ -185,15 +185,6 @@ def logical_optimize(dag_root: DataOp, config: OptConfig, env: dict = None,
     if config.unroll_choices:
         root = choice_unrolling(root)
 
-    # Propagate derived schemas through the Op DAG (part of broader metadata
-    # propagation used later for operator selection / parallelization planning).
-    # TODO: schemas are propagated once here, before algebraic_rewrites. Rewrites
-    # that create or replace ops leave new ops without a schema and replaced ones
-    # stale; re-propagate (or update incrementally) once rewrites start consuming
-    # output_schema.
-    if config.propagate_schema:
-        propagate_output_schema(root)
-
     # Final logical DAG
     if config.algebraic_rewrites:
         root = algebraic_rewrites(root, config.algebraic_rewrite_config)
@@ -204,6 +195,12 @@ def logical_optimize(dag_root: DataOp, config: OptConfig, env: dict = None,
     # terminating operator.
     if config.unroll_choices:
         root = install_candidate_set(root, search)
+
+    # Schemas go last of all, once the plan shape is final: anything above that
+    # creates or replaces an op would otherwise leave the new op without a schema
+    # and the replaced one stale. No rewrite consumes output_schema today.
+    if config.propagate_schema:
+        propagate_output_schema(root)
 
     _debug_validate_dag(root)  # operand refs after all logical rewrites, before lowering
     return root
@@ -267,7 +264,7 @@ def extract_numeric_operators(root):
 
 
 def propagate_output_schema(root):
-    """Propagate each op's output schema from its inputs (sources→sinks)."""
+    """Propagate each op's output schema from its inputs, bottom-up."""
     start = start_time()
     for op in topological_iterator(root):
         op.propagate_output_schema()

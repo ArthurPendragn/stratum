@@ -32,9 +32,7 @@ class AggregateOp(Op):
         self.output_type = OutputType.FRAME
 
     def propagate_output_schema(self):
-        """Best-effort: only a dict aggregation spec gives statically known output
-        columns (its keys); a bare function name or list spec is left unknown.
-        See :func:`_schema.aggregate_schema` for the exact rules."""
+        """See :func:`_schema.aggregate_schema` for which specs are knowable."""
         self.output_schema = _schema.aggregate_schema(
             self.inputs[0].output_schema,
             self.grouping_attributes,

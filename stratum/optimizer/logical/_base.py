@@ -226,13 +226,24 @@ class IRNode:
         self.is_y = is_y
         self.output_type = OutputType.UNKNOWN
         # Derived output schema (a polars.Schema, or None for "unknown"), filled in
-        # by the schema-propagation pass. See ir/_schema.py and Op.propagate_output_schema.
+        # by the schema-propagation pass. See ir/_schema.py and propagate_output_schema.
         self.output_schema = None
         self.is_split_op = False
         self.was_cloned = False
         self.remove_after: list[IRNode] = []
         #: Set by fit-pass planning: nothing the fitting pass runs needs this output.
         self.dead_in_fit = False
+
+    def propagate_output_schema(self):
+        """Default rule for the schema-propagation pass: the output is unknown.
+
+        Ops that can statically determine their columns override this; see
+        :mod:`stratum.optimizer.logical._schema` for the algebra they use and for the
+        families that deliberately keep this default. Lives on ``IRNode`` so that
+        physical nodes answer to the pass too (a physical source op is a
+        ``PhysicalOp``, not an ``Op``).
+        """
+        self.output_schema = None
 
     def to_str_helper(self):
         class_name = (self.__class__.__name__ if self._is_physical

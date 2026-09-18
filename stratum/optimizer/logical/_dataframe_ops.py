@@ -50,9 +50,25 @@ class ConcatOp(Op):
         self.output_type = OutputType.FRAME
 
     def propagate_output_schema(self):
-        """Concat merges schemas: the result holds every column appearing in any
-        operand (row-wise concat shares columns, column-wise concat unions them)."""
-        self.output_schema = _schema.union_columns([in_op.output_schema for in_op in self.inputs])
+        """See :func:`_schema.concat_schemas` for the per-axis rules.
+
+        The operands are ``first``/``others``, *not* ``self.inputs``: a literal
+        frame operand is stored inline rather than as an input edge, so reading
+        ``inputs`` would silently omit its columns."""
+        if isinstance(self.axis, OperandRef):
+            # The axis picks the dtype rule, so a graph-fed axis is unknown.
+            self.output_schema = None
+            return
+        operands = [self.first, *self.others]
+        self.output_schema = _schema.concat_schemas(
+            [self._operand_schema(o) for o in operands], self.axis)
+
+    def _operand_schema(self, operand):
+        """Schema of one concat operand: a graph-fed op's propagated schema, or
+        the schema of an inline constant frame."""
+        if isinstance(operand, OperandRef):
+            return self.inputs[operand.k].output_schema
+        return _schema.schema_of_frame(operand)
 
 
 # The accessors whose ``[...]`` takes one indexer per axis, so a tuple key is a

@@ -16,6 +16,7 @@ import polars as pl
 
 from stratum.optimizer.logical._base import (
     OutputType, _resolve_args, _resolve_kwargs)
+from stratum.optimizer.logical import _schema
 from stratum.optimizer.logical._ops import MethodCallOp, Op, OperandRef
 
 
@@ -254,6 +255,19 @@ class ColumnMethodOp(Op):
         self.method = method
         self.args = tuple(args or ())
         self.kwargs = dict(kwargs or {})
+
+    #: Methods whose result is a boolean mask whatever the input dtype is. The
+    #: others all depend on it: ``fillna`` upcasts on a float fill value, ``clip``
+    #: on a float bound, ``where`` null-pads the rows it masks out, and ``astype``
+    #: is handed its target (possibly per column), so none of them is certain here.
+    BOOLEAN_METHODS = frozenset({"isin", "notna"})
+
+    def propagate_output_schema(self):
+        """A column method is shape-preserving, so the column names carry over and
+        only the dtype can change. See :data:`BOOLEAN_METHODS`."""
+        dtype = (pl.Boolean if self.method in self.BOOLEAN_METHODS
+                 else _schema.UNKNOWN_DTYPE)
+        self.output_schema = _schema.cast_columns(self.inputs[0].output_schema, dtype)
 
     def resolved_call(self, inputs):
         return (

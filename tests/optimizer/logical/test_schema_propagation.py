@@ -13,17 +13,25 @@ from stratum.optimizer._op_utils import topological_iterator
 from stratum.optimizer.logical._dataframe_ops import (
     AggregateOp, AssignMapOp, AssignOp, ColumnProjectionOp, ConcatOp, DataSourceOp,
     DatetimeConversionOp, DropOp, GetAttrProjectionOp, JoinOp, MetadataOp,
-    SelectionOp, SplitOp, SplitOutput)
-from stratum.optimizer.logical._ops import BinOp, GetItemOp, Op, OperandRef, OutputType
+    SelectionKind, SelectionOp, SplitOp, SplitOutput)
+from stratum.optimizer.logical._ops import (
+    BinOp, ChoiceOp, GetItemOp, Op, OperandRef, OutputType, UnaryOp)
+from stratum.optimizer.logical._projection_ops import StringMethodOp
+from stratum.optimizer._optimize import optimize as optimize_full
+from stratum.optimizer.logical._candidate_ops import ScoreCandidatesOp
+from stratum.optimizer.logical._column_methods import ColumnMethodOp
+from stratum.optimizer.logical._scoring import Metric
+from tests._helpers import csv_file
 
 
 def _logical_ops(dag):
     """Logical ops of `dag` after frame extraction + schema propagation.
 
     Schema propagation is a logical pass, so the assertions look at the logical
-    DAG: the full `optimize()` pipeline goes on to lower these into physical ops,
-    which are fresh nodes and don't carry the propagated schema (see the TODO at
-    the call site in `logical_optimize`).
+    DAG rather than at the linearized plan the full `optimize()` returns. The
+    schema does survive lowering -- `install_lowered` carries it over -- but by
+    then an op is addressed by its physical impl class, which makes the
+    per-rule assertions here much harder to read.
     """
     root = logical_optimize(dag, OptConfig(dataframe_ops=True, propagate_schema=True))
     return list(topological_iterator(root))
@@ -91,6 +99,45 @@ class TestSchemaPropagation(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_csv_source_honours_reader_options_that_change_the_columns(self):
+        # read_kwargs are pandas reader options, and several of them change the
+        # resulting column set. Each case asserts against what pandas actually
+        # produces, so the rule can't drift from the reader it models.
+        cases = [
+            ({"sep": ";"}, {"sep": ";"}),
+            ({"header": None}, {"header": False}),
+            ({"sep": ";", "usecols": ["y"]}, {"sep": ";"}),
+            ({"sep": ";", "index_col": 0}, {"sep": ";"}),
+        ]
+        for read_kwargs, write_kwargs in cases:
+            with self.subTest(read_kwargs=read_kwargs), csv_file(self.df, **write_kwargs) as path:
+                expected = list(pd.read_csv(path, **read_kwargs).columns)
+                op = DataSourceOp(file_path=path, _format="csv", read_kwargs=read_kwargs)
+                op.propagate_output_schema()
+                self.assertEqual(expected, list(op.output_schema.keys()))
+
+    def test_csv_source_header_none_keeps_pandas_integer_labels(self):
+        # header=None makes pandas name the columns 0..n-1; the schema keeps those
+        # labels verbatim rather than stringifying them.
+        with csv_file(self.df, header=False) as path:
+            op = DataSourceOp(file_path=path, _format="csv", read_kwargs={"header": None})
+            op.propagate_output_schema()
+            self.assertEqual([0, 1, 2], list(op.output_schema.keys()))
+
+    def test_csv_source_graph_fed_reader_option_is_unknown(self):
+        # a graph-fed option is still an OperandRef at plan time, so the column
+        # set it implies isn't knowable.
+        with csv_file(self.df) as path:
+            op = DataSourceOp(file_path=path, _format="csv",
+                              read_kwargs={"sep": OperandRef(0)})
+            op.propagate_output_schema()
+            self.assertIsNone(op.output_schema)
+
+    def test_non_csv_source_format_is_unknown(self):
+        op = DataSourceOp(file_path="/some/file.parquet", _format="parquet")
+        op.propagate_output_schema()
+        self.assertIsNone(op.output_schema)
+
     def test_csv_source_unreadable_path_falls_back_to_unknown(self):
         op = DataSourceOp(file_path="/no/such/file.csv", _format="csv")
         op.propagate_output_schema()
@@ -122,10 +169,34 @@ class TestSchemaPropagation(unittest.TestCase):
         op.propagate_output_schema()
         self.assertEqual(["x", "y"], list(op.output_schema.keys()))
 
-    def test_drop_row_axis_is_unknown(self):
-        # a positional row drop (`df.drop(labels)`, axis defaults to 0) names no
-        # columns statically, so the schema can't be resolved -> unknown.
-        op = DropOp(args=[[0, 1]], kwargs={"axis": 0})
+    def test_row_drop_keeps_every_column(self):
+        # `drop` defaults to axis=0, i.e. dropping *rows* by index label, which
+        # leaves the column set untouched. Ground truth from pandas per spelling.
+        frame = pd.DataFrame({"x": [1, 2], "y": [3, 4]})
+        schema = pl.Schema({"x": pl.Int64, "y": pl.Int64})
+        cases = [
+            (dict(args=[[0]], kwargs={}), dict(labels=[0])),
+            (dict(args=[[0]], kwargs={"axis": 0}), dict(labels=[0], axis=0)),
+            (dict(args=[[0]], kwargs={"axis": "index"}), dict(labels=[0], axis="index")),
+            (dict(args=[], kwargs={"index": [0]}), dict(index=[0])),
+        ]
+        for op_kwargs, drop_kwargs in cases:
+            with self.subTest(drop_kwargs=drop_kwargs):
+                op = DropOp(**op_kwargs)
+                op.inputs = [_stub(schema)]
+                op.propagate_output_schema()
+                self.assertEqual(list(frame.drop(**drop_kwargs).columns),
+                                 list(op.output_schema.keys()))
+
+    def test_drop_with_a_string_column_axis_removes_columns(self):
+        op = DropOp(args=[["y"]], kwargs={"axis": "columns"})
+        op.inputs = [_stub(pl.Schema({"x": pl.Int64, "y": pl.Int64}))]
+        op.propagate_output_schema()
+        self.assertEqual(["x"], list(op.output_schema.keys()))
+
+    def test_drop_with_a_graph_fed_axis_is_unknown(self):
+        # the axis decides whether this touches the columns at all.
+        op = DropOp(args=[["y"]], kwargs={"axis": OperandRef(1)})
         op.inputs = [_stub(pl.Schema({"x": pl.Int64, "y": pl.Int64}))]
         op.propagate_output_schema()
         self.assertIsNone(op.output_schema)
@@ -180,6 +251,85 @@ class TestSchemaPropagation(unittest.TestCase):
         data = st.as_data_op(self.df)
         op = _schema_op(data[data["x"] > 1], SelectionOp)
         self.assertEqual(["x", "y", "z"], list(op.output_schema.keys()))
+
+    def test_row_wise_dropna_preserves_schema(self):
+        frame = pd.DataFrame({"a": [1.0, 2.0], "b": [None, 3.0]})
+        for kwargs in ({}, {"axis": 0}, {"axis": "index"}):
+            with self.subTest(kwargs=kwargs):
+                op = _schema_op(st.as_data_op(frame).dropna(**kwargs), SelectionOp)
+                self.assertEqual(["a", "b"], list(op.output_schema.keys()))
+
+    def test_column_wise_dropna_is_unknown(self):
+        # `dropna(axis=1)` drops the columns that contain nulls, so it is not a
+        # relational selection at all, and which columns go is value-dependent.
+        frame = pd.DataFrame({"a": [1.0, 2.0], "b": [None, 3.0]})
+        self.assertEqual(["a"], list(frame.dropna(axis=1).columns))
+        for kwargs in ({"axis": 1}, {"axis": "columns"}):
+            with self.subTest(kwargs=kwargs):
+                op = _schema_op(st.as_data_op(frame).dropna(**kwargs), SelectionOp)
+                self.assertIsNone(op.output_schema)
+
+    def test_selection_without_a_source_edge_is_unknown(self):
+        # a detached selection has no input to pass a schema through.
+        op = SelectionOp(kind=SelectionKind.HEAD)
+        op.propagate_output_schema()
+        self.assertIsNone(op.output_schema)
+
+    def test_duplicate_projection_labels_are_unknown(self):
+        # `df[["a", "a"]]` really yields two `a` columns; a Schema cannot express
+        # that, and narrowing it to one would understate the output.
+        self.assertEqual(["a", "a"],
+                         list(pd.DataFrame({"a": [1], "b": [2]})[["a", "a"]].columns))
+        op = GetItemOp(key=["a", "a"])
+        op.inputs = [_stub(pl.Schema({"a": pl.Int64, "b": pl.Int64}), OutputType.FRAME)]
+        op.propagate_output_schema()
+        self.assertIsNone(op.output_schema)
+
+    def test_rename_collision_is_unknown(self):
+        # two columns renamed onto one label: pandas keeps both.
+        self.assertEqual(["c", "c"], list(pd.DataFrame({"a": [1], "b": [2]})
+                                          .rename(columns={"a": "c", "b": "c"}).columns))
+        op = MetadataOp(func="rename", kwargs={"columns": {"a": "c", "b": "c"}})
+        op.inputs = [_stub(pl.Schema({"a": pl.Int64, "b": pl.Float64}))]
+        op.propagate_output_schema()
+        self.assertIsNone(op.output_schema)
+
+    def test_index_only_rename_keeps_the_columns(self):
+        # a rename aimed at the index leaves the column names untouched.
+        frame = pd.DataFrame({"x": [1, 2], "y": [3, 4]})
+        schema = pl.Schema({"x": pl.Int64, "y": pl.Int64})
+        for op_kwargs, rename_kwargs in [
+            (dict(kwargs={"index": {0: 9}}), dict(index={0: 9})),
+            (dict(args=[{0: 9}], kwargs={}), dict(mapper={0: 9})),
+        ]:
+            with self.subTest(rename_kwargs=rename_kwargs):
+                op = MetadataOp(func="rename", **op_kwargs)
+                op.inputs = [_stub(schema)]
+                op.propagate_output_schema()
+                self.assertEqual(list(frame.rename(**rename_kwargs).columns),
+                                 list(op.output_schema.keys()))
+
+    def test_rename_with_a_graph_fed_axis_is_unknown(self):
+        op = MetadataOp(func="rename", args=[{"x": "a"}], kwargs={"axis": OperandRef(1)})
+        op.inputs = [_stub(pl.Schema({"x": pl.Int64}))]
+        op.propagate_output_schema()
+        self.assertIsNone(op.output_schema)
+
+    def test_score_candidates_schema_matches_the_table_it_builds(self):
+        # `process` builds pl.DataFrame({"id": names, "scores": metric values}),
+        # plus "vals" when emit_predictions.
+        metric = Metric(name="acc", fn=lambda y_true, values: 0.5)
+        real = pl.DataFrame({"id": ["c0", "c1"], "scores": [0.5, 0.7]}).schema
+
+        op = ScoreCandidatesOp(candidate_names=["c0", "c1"], metric=metric)
+        op.propagate_output_schema()
+        self.assertEqual(real, op.output_schema)
+
+        op = ScoreCandidatesOp(candidate_names=["c0", "c1"], metric=metric,
+                               emit_predictions=True)
+        op.propagate_output_schema()
+        self.assertEqual(["id", "scores", "vals"], list(op.output_schema.keys()))
+        self.assertEqual(pl.Unknown, op.output_schema["vals"])
 
     def test_projection_of_absent_column_is_unknown(self):
         # selecting a column the input schema doesn't carry can't be resolved
@@ -245,6 +395,74 @@ class TestSchemaPropagation(unittest.TestCase):
         op.propagate_output_schema()
         self.assertEqual(["a", "b"], list(op.output_schema.keys()))
 
+    def test_concat_includes_inline_constant_operand(self):
+        # an operand that was a literal frame is stored in `others`, not as an
+        # input edge, so reading `inputs` would silently drop its columns.
+        op = ConcatOp(first=OperandRef(0), others=[pd.DataFrame({"c": [3]})], axis=1)
+        op.inputs = [_stub(pl.Schema({"a": pl.Int64, "b": pl.Int64}))]
+        op.propagate_output_schema()
+        self.assertEqual(["a", "b", "c"], list(op.output_schema.keys()))
+
+    def test_concat_of_only_constant_operands_is_not_an_empty_schema(self):
+        # with no graph-fed operand there are no inputs at all; the result must be
+        # the constants' columns, never a *known* zero-column schema.
+        op = ConcatOp(first=pd.DataFrame({"c": [1]}),
+                      others=[pd.DataFrame({"d": [2]})], axis=1)
+        op.inputs = []
+        op.propagate_output_schema()
+        self.assertEqual(["c", "d"], list(op.output_schema.keys()))
+
+    def test_concat_graph_fed_axis_is_unknown(self):
+        # the axis selects the dtype rule, so an unresolvable axis is unknown.
+        op = ConcatOp(first=OperandRef(0), others=[OperandRef(1)], axis=OperandRef(2))
+        op.inputs = [_stub(pl.Schema({"a": pl.Int64})),
+                     _stub(pl.Schema({"a": pl.Int64})), _stub(None)]
+        op.propagate_output_schema()
+        self.assertIsNone(op.output_schema)
+
+    def test_row_concat_drops_dtype_of_column_absent_from_an_operand(self):
+        # ground truth: pandas null-fills the missing column, widening it to float.
+        frames = [pd.DataFrame({"a": [1]}), pd.DataFrame({"a": [2], "b": [3]})]
+        actual = pd.concat(frames).dtypes
+        self.assertEqual("int64", str(actual["a"]))
+        self.assertEqual("float64", str(actual["b"]))
+
+        op = ConcatOp(first=OperandRef(0), others=[OperandRef(1)], axis=0)
+        op.inputs = [_stub(pl.Schema({"a": pl.Int64})),
+                     _stub(pl.Schema({"a": pl.Int64, "b": pl.Int64}))]
+        op.propagate_output_schema()
+        self.assertEqual(pl.Int64, op.output_schema["a"])     # in every operand
+        self.assertEqual(pl.Unknown, op.output_schema["b"])   # widened by pandas
+
+    def test_row_concat_drops_dtype_when_operands_disagree(self):
+        op = ConcatOp(first=OperandRef(0), others=[OperandRef(1)], axis=0)
+        op.inputs = [_stub(pl.Schema({"a": pl.Int64})), _stub(pl.Schema({"a": pl.Float64}))]
+        op.propagate_output_schema()
+        self.assertEqual(pl.Unknown, op.output_schema["a"])
+
+    def test_column_concat_drops_every_dtype(self):
+        # ground truth: a misaligned index null-fills *both* columns, and index
+        # alignment can't be known statically -- so no dtype survives.
+        actual = pd.concat([pd.DataFrame({"a": [1]}),
+                            pd.DataFrame({"b": [2]}, index=[5])], axis=1).dtypes
+        self.assertEqual(["float64", "float64"], [str(dt) for dt in actual])
+
+        op = ConcatOp(first=OperandRef(0), others=[OperandRef(1)], axis=1)
+        op.inputs = [_stub(pl.Schema({"a": pl.Int64})), _stub(pl.Schema({"b": pl.Int64}))]
+        op.propagate_output_schema()
+        self.assertEqual(["a", "b"], list(op.output_schema.keys()))
+        self.assertTrue(all(dt == pl.Unknown for dt in op.output_schema.values()))
+
+    def test_column_concat_with_a_shared_name_is_unknown(self):
+        # pandas keeps both columns; a Schema can't express a duplicate name.
+        self.assertEqual(["x", "x"], list(pd.concat(
+            [pd.DataFrame({"x": [1]}), pd.DataFrame({"x": [2]})], axis=1).columns))
+
+        op = ConcatOp(first=OperandRef(0), others=[OperandRef(1)], axis=1)
+        op.inputs = [_stub(pl.Schema({"x": pl.Int64})), _stub(pl.Schema({"x": pl.Int64}))]
+        op.propagate_output_schema()
+        self.assertIsNone(op.output_schema)
+
     # --- split (X, y fan-out) -------------------------------------------
     def test_split_outputs_carry_their_input_schema(self):
         x = _stub(pl.Schema({"a": pl.Int64, "b": pl.Int64}), OutputType.FRAME)
@@ -297,6 +515,111 @@ class TestSchemaPropagation(unittest.TestCase):
         op.propagate_output_schema()
         self.assertIsNone(op.output_schema)
 
+    def test_join_how_widens_the_nullable_sides_dtypes(self):
+        # An unmatched row is null-filled, which widens int64 -> float64. Ground
+        # truth comes from pandas for every `how`; the join key never gains nulls.
+        left = pd.DataFrame({"id": [1, 2], "lv": [1, 2]})
+        right = pd.DataFrame({"id": [1, 3], "rv": [9, 8]})
+        left_schema = pl.Schema({"id": pl.Int64, "lv": pl.Int64})
+        right_schema = pl.Schema({"id": pl.Int64, "rv": pl.Int64})
+
+        for how in ("inner", "left", "right", "outer"):
+            with self.subTest(how=how):
+                actual = left.merge(right, on="id", how=how).dtypes
+                op = JoinOp(how=how, left_on="id", right_on="id")
+                op.inputs = [_stub(left_schema), _stub(right_schema)]
+                op.propagate_output_schema()
+                self.assertEqual(list(actual.index), list(op.output_schema.keys()))
+                for name, real_dtype in actual.items():
+                    # pandas kept int64 <=> the schema is allowed to keep Int64
+                    if str(real_dtype) == "int64":
+                        self.assertEqual(pl.Int64, op.output_schema[name], name)
+                    else:
+                        self.assertEqual(pl.Unknown, op.output_schema[name], name)
+
+    def test_join_key_collapse_matches_pandas_for_every_key_spelling(self):
+        # pandas pairs left_on/right_on *positionally* and collapses a pair only
+        # when both names are equal; a bare merge() infers the keys from the common
+        # columns. A set intersection models neither, so every spelling is checked
+        # against the columns pandas actually produces.
+        kv = pd.DataFrame({"k": [1, 2], "v": [1, 2]})
+        kw = pd.DataFrame({"k": [1, 3], "w": [9, 8]})
+        kv_s = pl.Schema({"k": pl.Int64, "v": pl.Int64})
+        kw_s = pl.Schema({"k": pl.Int64, "w": pl.Int64})
+        ab = pd.DataFrame({"a": [1], "b": [2]})
+        ab_s = pl.Schema({"a": pl.Int64, "b": pl.Int64})
+
+        cases = [
+            # (JoinOp kwargs, merge kwargs, left frame/schema, right frame/schema)
+            (dict(), dict(), kv, kw, kv_s, kw_s),
+            (dict(left_on="k", right_on="k"), dict(on="k"), kv, kw, kv_s, kw_s),
+            (dict(how="cross"), dict(how="cross"), kv, kw, kv_s, kw_s),
+            (dict(left_index=True, right_index=True),
+             dict(left_index=True, right_index=True), kv, kw, kv_s, kw_s),
+            # shares both names, collapses neither: pandas emits a_x,b_x,a_y,b_y
+            (dict(left_on=["a", "b"], right_on=["b", "a"]),
+             dict(left_on=["a", "b"], right_on=["b", "a"]), ab, ab, ab_s, ab_s),
+            (dict(left_on="a", right_on="b"),
+             dict(left_on="a", right_on="b"), ab, ab, ab_s, ab_s),
+        ]
+        for join_kwargs, merge_kwargs, left, right, left_s, right_s in cases:
+            with self.subTest(join_kwargs=join_kwargs):
+                op = JoinOp(**join_kwargs)
+                op.inputs = [_stub(left_s), _stub(right_s)]
+                op.propagate_output_schema()
+                self.assertEqual(list(left.merge(right, **merge_kwargs).columns),
+                                 list(op.output_schema.keys()))
+
+    def test_join_mixing_a_key_column_with_an_index_is_unknown(self):
+        # pandas emits an extra key column for `left_on=... , right_index=True`
+        # (k, k_x, k_y from two frames holding k), which isn't modelled.
+        op = JoinOp(left_on="k", right_index=True)
+        op.inputs = [_stub(pl.Schema({"k": pl.Int64, "v": pl.Int64})),
+                     _stub(pl.Schema({"k": pl.Int64, "w": pl.Int64}))]
+        op.propagate_output_schema()
+        self.assertIsNone(op.output_schema)
+
+    def test_join_graph_fed_keys_are_unknown(self):
+        op = JoinOp(left_on=OperandRef(2), right_on="k")
+        op.inputs = [_stub(pl.Schema({"k": pl.Int64})), _stub(pl.Schema({"k": pl.Int64}))]
+        op.propagate_output_schema()
+        self.assertIsNone(op.output_schema)
+
+    def test_collapsed_key_keeps_its_dtype_only_when_both_sides_agree(self):
+        # The collapsed key is the two key columns merged into one, and which side
+        # wins depends on `how`: pandas keeps the left's int32 for inner/left but
+        # takes the right's float64 for right/outer. No single dtype is correct for
+        # a disagreeing pair, so it has to be Unknown.
+        left = pd.DataFrame({"k": pd.Series([1, 2], dtype="int32"), "v": [1, 2]})
+        right = pd.DataFrame({"k": pd.Series([1.0, 3.0], dtype="float64"), "w": [9, 8]})
+        self.assertEqual(
+            {"inner": "int32", "left": "int32", "right": "float64", "outer": "float64"},
+            {how: str(left.merge(right, on="k", how=how).dtypes["k"])
+             for how in ("inner", "left", "right", "outer")})
+
+        for how in ("inner", "left", "right", "outer"):
+            with self.subTest(how=how):
+                op = JoinOp(how=how, left_on="k", right_on="k")
+                op.inputs = [_stub(pl.Schema({"k": pl.Int32, "v": pl.Int64})),
+                             _stub(pl.Schema({"k": pl.Float64, "w": pl.Int64}))]
+                op.propagate_output_schema()
+                self.assertEqual(pl.Unknown, op.output_schema["k"])
+
+        # agreeing key dtypes still survive, even through an outer join
+        op = JoinOp(how="outer", left_on="k", right_on="k")
+        op.inputs = [_stub(pl.Schema({"k": pl.Int64, "v": pl.Int64})),
+                     _stub(pl.Schema({"k": pl.Int64, "w": pl.Int64}))]
+        op.propagate_output_schema()
+        self.assertEqual(pl.Int64, op.output_schema["k"])
+
+    def test_join_suffix_collision_is_unknown(self):
+        # `.join()` defaults to empty suffixes; two overlapping columns would land
+        # on the same label, which pandas rejects and a Schema cannot express.
+        op = JoinOp(left_index=True, right_index=True, suffixes=("", ""))
+        op.inputs = [_stub(pl.Schema({"a": pl.Int64})), _stub(pl.Schema({"a": pl.Int64}))]
+        op.propagate_output_schema()
+        self.assertIsNone(op.output_schema)
+
     def test_join_unknown_input_propagates(self):
         op = JoinOp(how="inner", left_on="k", right_on="k", suffixes=("_x", "_y"))
         op.inputs = [_stub(pl.Schema({"k": pl.Int64})), _stub(None)]
@@ -333,11 +656,49 @@ class TestSchemaPropagation(unittest.TestCase):
         self.assertEqual(["d"], list(op.output_schema.keys()))
         self.assertEqual(pl.Unknown, op.output_schema["d"])
 
+    def test_non_accessor_attribute_is_unknown(self):
+        # make_frame_get_attr wraps *any* attribute of a frame-like input, but only
+        # an accessor projection preserves the columns. `.T` transposes (its columns
+        # become the old index labels), `.values` is an ndarray, `.shape` a tuple.
+        self.assertEqual([0, 1], list(pd.DataFrame({"a": [1, 2], "b": [3, 4]}).T.columns))
+
+        src = _stub(pl.Schema({"a": pl.Int64, "b": pl.Int64}))
+        for attr_name in (["T"], ["values"], ["shape"], ["index"], ["columns"],
+                          ["loc"], ["iloc"], ["dt"], ["dt", "year", "extra"]):
+            with self.subTest(attr_name=attr_name):
+                op = GetAttrProjectionOp(attr_name=attr_name, inputs=[src], outputs=[])
+                op.propagate_output_schema()
+                self.assertIsNone(op.output_schema)
+
     def test_getattr_projection_unknown_input_propagates(self):
         op = GetAttrProjectionOp(attr_name="dt")
         op.inputs = [_stub(None)]
         op.propagate_output_schema()
         self.assertIsNone(op.output_schema)
+
+    def test_dt_attributes_fanning_out_columns_are_unknown(self):
+        # `.dt` is not uniformly column-preserving: these two are the whole-frame
+        # members of the namespace, so the gate is per attribute, not per namespace.
+        td = pd.Series(pd.to_timedelta(["1 days 2:03:04"]))
+        self.assertEqual(7, len(td.dt.components.columns))
+        self.assertEqual(3, len(pd.Series(pd.to_datetime(["2024-01-01"])).dt.isocalendar().columns))
+
+        src = _stub(pl.Schema({"t": pl.Duration("us")}))
+        for attr in ("components", "isocalendar"):
+            with self.subTest(attr=attr):
+                op = GetAttrProjectionOp(attr_name=["dt", attr], inputs=[src], outputs=[])
+                op.propagate_output_schema()
+                self.assertIsNone(op.output_schema)
+
+    def test_dt_allow_list_holds_only_series_valued_properties(self):
+        # Guards the allow-list against a member that isn't actually one-to-one.
+        stamps = pd.Series(pd.to_datetime(["2024-03-05 01:02:03"]))
+        spans = pd.Series(pd.to_timedelta(["1 days 2:03:04"]))
+        for attr in GetAttrProjectionOp.ELEMENTWISE_ACCESSORS["dt"]:
+            with self.subTest(attr=attr):
+                values = [getattr(s.dt, attr, None) for s in (stamps, spans)]
+                self.assertTrue(any(isinstance(v, pd.Series) for v in values))
+                self.assertFalse(any(isinstance(v, pd.DataFrame) for v in values))
 
     # --- aggregation (groupby.agg) --------------------------------------
     def test_aggregate_dict_spec_keys_are_columns(self):
@@ -406,6 +767,79 @@ class TestSchemaPropagation(unittest.TestCase):
         op.propagate_output_schema()
         self.assertIsNone(op.output_schema)
 
+    def test_binop_dtype_matches_what_pandas_actually_returns(self):
+        # The columns were always right; the *dtypes* used to be copied from the
+        # operand, which lies for every operator that changes them. Each case
+        # checks the schema's boolean-ness against pandas' real output dtype.
+        frame = pd.DataFrame({"a": [1, 2]})
+        schema = pl.Schema({"a": pl.Int64})
+        for name in ("gt", "lt", "ge", "le", "eq", "ne", "add", "sub", "mul",
+                     "truediv", "floordiv", "mod", "and_", "or_", "xor"):
+            func = getattr(operator, name)
+            with self.subTest(op=name):
+                actual_is_bool = str(func(frame, 1).dtypes["a"]) == "bool"
+                op = BinOp(op=func, left=OperandRef(0), right=1)
+                op.output_type = OutputType.FRAME
+                op.inputs = [_stub(schema, OutputType.FRAME)]
+                op.propagate_output_schema()
+                dtype = op.output_schema["a"]
+                self.assertEqual(["a"], list(op.output_schema.keys()))
+                if actual_is_bool:
+                    self.assertEqual(pl.Boolean, dtype)
+                else:
+                    # not statically certain -> must not claim the operand's dtype
+                    self.assertEqual(pl.Unknown, dtype)
+                    self.assertNotEqual(pl.Int64, dtype)
+
+    def test_logical_op_is_boolean_only_when_operands_are_boolean(self):
+        # `&` is *logical* on booleans but *bitwise* on integers, so it only yields
+        # a boolean when both operands already are.
+        int_frame, bool_frame = pd.DataFrame({"a": [1, 2]}), pd.DataFrame({"a": [True, False]})
+        self.assertEqual("int64", str((int_frame & int_frame).dtypes["a"]))
+        self.assertEqual("bool", str((bool_frame & bool_frame).dtypes["a"]))
+
+        for dtype, expected in [(pl.Int64, pl.Unknown), (pl.Boolean, pl.Boolean)]:
+            with self.subTest(dtype=dtype):
+                op = BinOp(op=operator.and_, left=OperandRef(0), right=OperandRef(1))
+                op.output_type = OutputType.FRAME
+                op.inputs = [_stub(pl.Schema({"a": dtype}), OutputType.FRAME),
+                             _stub(pl.Schema({"a": dtype}), OutputType.FRAME)]
+                op.propagate_output_schema()
+                self.assertEqual(expected, op.output_schema["a"])
+
+    def test_logical_op_with_a_constant_operand_is_unknown(self):
+        # the constant's dtype isn't known, so boolean-ness can't be established.
+        op = BinOp(op=operator.and_, left=OperandRef(0), right=1)
+        op.output_type = OutputType.FRAME
+        op.inputs = [_stub(pl.Schema({"a": pl.Boolean}), OutputType.FRAME)]
+        op.propagate_output_schema()
+        self.assertEqual(pl.Unknown, op.output_schema["a"])
+
+    def test_unary_op_keeps_columns_and_derives_dtype(self):
+        # UnaryOp had no rule at all, so `~mask` / `-df` lost the schema entirely.
+        self.assertEqual("bool", str((~pd.DataFrame({"m": [True]})).dtypes["m"]))
+        self.assertEqual("int64", str((-pd.DataFrame({"a": [1]})).dtypes["a"]))
+
+        op = UnaryOp(op=operator.invert, operand=OperandRef(0))
+        op.output_type = OutputType.SERIES
+        op.inputs = [_stub(pl.Schema({"m": pl.Boolean}), OutputType.SERIES)]
+        op.propagate_output_schema()
+        self.assertEqual(pl.Boolean, op.output_schema["m"])
+
+        op = UnaryOp(op=operator.neg, operand=OperandRef(0))
+        op.output_type = OutputType.FRAME
+        op.inputs = [_stub(pl.Schema({"a": pl.Int64}), OutputType.FRAME)]
+        op.propagate_output_schema()
+        self.assertEqual(["a"], list(op.output_schema.keys()))
+        self.assertEqual(pl.Unknown, op.output_schema["a"])
+
+    def test_unary_op_non_frame_output_is_unknown(self):
+        op = UnaryOp(op=operator.neg, operand=OperandRef(0))
+        op.output_type = OutputType.SCALAR
+        op.inputs = [_stub(pl.Schema({"a": pl.Int64}), OutputType.FRAME)]
+        op.propagate_output_schema()
+        self.assertIsNone(op.output_schema)
+
     def test_binop_non_frame_output_is_unknown(self):
         # a scalar-producing op (e.g. reduction) carries no column schema.
         op = BinOp(op=operator.add, left=OperandRef(0), right=OperandRef(1))
@@ -422,6 +856,107 @@ class TestSchemaPropagation(unittest.TestCase):
         op.propagate_output_schema()
         self.assertIsNone(op.output_schema)
 
+    # --- string accessor / choice ---------------------------------------
+    def test_string_method_keeps_columns_retypes(self):
+        # `.str.<method>` is elementwise: names survive, dtype varies by method
+        # (contains->bool, len->int, lower->str) and the backends disagree, so it
+        # is left Unknown.
+        op = StringMethodOp(method="lower")
+        op.inputs = [_stub(pl.Schema({"s": pl.String}))]
+        op.propagate_output_schema()
+        self.assertEqual(["s"], list(op.output_schema.keys()))
+        self.assertEqual(pl.Unknown, op.output_schema["s"])
+
+    def test_column_method_keeps_columns_and_derives_dtype(self):
+        # a column method is shape-preserving, so only the dtype can change:
+        # isin/notna are always boolean, the rest depend on the input.
+        column = pd.Series([1, 2, 3])
+        self.assertEqual("bool", str(column.isin([1]).dtype))
+        self.assertEqual("bool", str(column.notna().dtype))
+        self.assertEqual("float64", str(column.where(column > 1).dtype))
+
+        for method, expected in [("isin", pl.Boolean), ("notna", pl.Boolean),
+                                 ("fillna", pl.Unknown), ("clip", pl.Unknown),
+                                 ("where", pl.Unknown), ("astype", pl.Unknown)]:
+            with self.subTest(method=method):
+                op = ColumnMethodOp(method=method)
+                op.inputs = [_stub(pl.Schema({"x": pl.Int64}), OutputType.SERIES)]
+                op.propagate_output_schema()
+                self.assertEqual(["x"], list(op.output_schema.keys()))
+                self.assertEqual(expected, op.output_schema["x"])
+
+    def test_column_method_unknown_input_propagates(self):
+        op = ColumnMethodOp(method="fillna")
+        op.inputs = [_stub(None)]
+        op.propagate_output_schema()
+        self.assertIsNone(op.output_schema)
+
+    def test_string_method_unknown_input_propagates(self):
+        op = StringMethodOp(method="lower")
+        op.inputs = [_stub(None)]
+        op.propagate_output_schema()
+        self.assertIsNone(op.output_schema)
+
+    def test_string_method_fanning_out_columns_is_unknown(self):
+        # These return a frame of new columns rather than a same-named column, so
+        # reporting the operand's name would be a wrong name, not a coarse one.
+        # `split`/`rsplit` do it under `expand=True`; `cat()` collapses to a str.
+        for method in ("extract", "extractall", "get_dummies", "partition",
+                       "rpartition", "split", "rsplit", "cat"):
+            with self.subTest(method=method):
+                op = StringMethodOp(method=method)
+                op.inputs = [_stub(pl.Schema({"s": pl.String}))]
+                op.propagate_output_schema()
+                self.assertIsNone(op.output_schema)
+
+    def test_string_method_one_to_one_methods_are_all_scalar(self):
+        # Guards the allow-list against a member that isn't actually one-to-one.
+        col = pd.Series(["a-b", "c-d"])
+        for method in StringMethodOp.ONE_TO_ONE_METHODS:
+            with self.subTest(method=method):
+                func = getattr(col.str, method)
+                result = None
+                for args in ((), ("a",), (1,), ("a", "b")):
+                    try:
+                        result = func(*args)
+                        break
+                    except Exception:
+                        continue
+                self.assertIsInstance(result, pd.Series)
+
+    def test_choice_is_unknown_by_design(self):
+        # A choice picks one of several pipelines and sits at the end of the DAG,
+        # so no operator downstream needs its schema. Unifying the outcomes'
+        # schemas would be work with no consumer: it stays unknown even when every
+        # outcome agrees.
+        agreed = pl.Schema({"a": pl.Int64})
+        op = ChoiceOp(outcome_names=[[("c", f"Opt{i}")] for i in range(2)])
+        op.inputs = [_stub(agreed), _stub(agreed)]
+        op.propagate_output_schema()
+        self.assertIsNone(op.output_schema)
+
+    # --- pass wiring ----------------------------------------------------
+    def test_schema_survives_lowering_into_the_physical_plan(self):
+        # Most families keep their schema for free, because implementation selection
+        # rebinds op.__class__ in place. A lowering rule builds a *fresh* node, so
+        # the source op would lose its schema without install_lowered copying it --
+        # and only the full optimize() pipeline can show that.
+        ops, *_ = optimize_full(st.as_data_op(self.df).drop(columns=["z"]), OptConfig())
+        by_family = {type(o).__name__: o.output_schema for o in ops}
+        self.assertTrue(any("InMemoryFrame" in n for n in by_family), by_family)
+        source = next(s for n, s in by_family.items() if "InMemoryFrame" in n)
+        drop = next(s for n, s in by_family.items() if "DropOp" in n)
+        self.assertEqual(["x", "y", "z"], list(source.keys()))
+        self.assertEqual(["x", "y"], list(drop.keys()))
+
+    def test_every_plan_node_answers_to_the_pass(self):
+        # the default rule lives on IRNode, not Op, so physical-only nodes (which
+        # are PhysicalOps, not Ops) respond too.
+        ops, *_ = optimize_full(st.as_data_op(self.df).drop(columns=["z"]), OptConfig())
+        for op in ops:
+            with self.subTest(op=type(op).__name__):
+                self.assertTrue(hasattr(op, "propagate_output_schema"))
+
     # --- ops without a propagation rule fall back to unknown ------------
     def test_generic_op_falls_back_to_unknown(self):
         # the base Op (any non-frame / no-rule op) yields the unknown schema.
@@ -434,15 +969,35 @@ class TestSchemaPropagation(unittest.TestCase):
         date = st.as_data_op(dt_df)["d"].skb.apply_func(pd.to_datetime)
         op = _schema_op(date, DatetimeConversionOp)
         self.assertEqual(["d"], list(op.output_schema.keys()))
-        self.assertIsInstance(op.output_schema["d"], pl.Datetime)
+        # The column *name* survives, but the Datetime unit is backend-dependent
+        # (pandas -> ns, polars -> us) and pl.Schema has no unit-less Datetime, so
+        # the dtype cannot be committed to at the logical layer.
+        self.assertEqual(pl.Unknown, op.output_schema["d"])
 
-    def test_datetime_conversion_multi_column_retypes_all(self):
-        # to_datetime over a frame keeps every column name and retypes to Datetime.
-        op = DatetimeConversionOp()
-        op.inputs = [_stub(pl.Schema({"d1": pl.String, "d2": pl.String}))]
-        op.propagate_output_schema()
-        self.assertEqual(["d1", "d2"], list(op.output_schema.keys()))
-        self.assertTrue(all(isinstance(dt, pl.Datetime) for dt in op.output_schema.values()))
+    def test_datetime_conversion_over_a_frame_is_unknown(self):
+        # `pd.to_datetime(frame)` is the assembly form: it reads year/month/day and
+        # fans them in to one unnamed Series, so the input's names are not the
+        # output's. Any other frame raises, so there is no frame-in/frame-out form.
+        assembled = pd.to_datetime(pd.DataFrame({"year": [2024], "month": [1], "day": [2]}))
+        self.assertIsInstance(assembled, pd.Series)
+        with self.assertRaises(ValueError):
+            pd.to_datetime(pd.DataFrame({"d1": ["2024-01-01"], "d2": ["2025-02-02"]}))
+
+        for output_type in (OutputType.FRAME, OutputType.UNKNOWN):
+            with self.subTest(output_type=output_type):
+                op = DatetimeConversionOp()
+                op.inputs = [_stub(pl.Schema({"year": pl.Int64, "month": pl.Int64,
+                                              "day": pl.Int64}), output_type)]
+                op.propagate_output_schema()
+                self.assertIsNone(op.output_schema)
+
+    def test_datetime_unit_is_not_expressible_in_a_schema(self):
+        # Pins the reason the rule can't name a Datetime unit: a unit-less
+        # pl.Datetime is rejected outright, and the two backends disagree on the
+        # unit, so there is no correct single answer at the logical layer.
+        with self.assertRaises(TypeError):
+            pl.Schema({"d": pl.Datetime})
+        self.assertNotEqual(pl.Datetime("ns"), pl.Datetime("us"))
 
 
 if __name__ == "__main__":

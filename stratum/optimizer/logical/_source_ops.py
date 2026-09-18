@@ -36,48 +36,41 @@ class DataSourceOp(Op):
         self.output_type = OutputType.MATRIX if _format == "npy" else OutputType.FRAME
 
     def propagate_output_schema(self):
-        """Source schema: read from the in-memory frame, or the file header.
-
-        Column *names* are authoritative; *dtypes* are only kept when they are
-        statically certain. A pandas ``object`` column has no column-level element
-        type (it must be inferred by scanning values, which can be confidently
-        wrong -- e.g. ints in early rows, strings later), and a CSV column's dtype
-        needs a full-file scan, so in both cases we keep the name but mark the
-        dtype ``Unknown``. Falls back to the unknown schema (``None``) when even
-        the names can't be read statically (a graph-fed path, an npy matrix, or an
-        unreadable file)."""
+        """Read from the in-memory frame, or the file header; unknown when the
+        names can't be read statically (graph-fed path, non-csv format)."""
         if self.data is not None:
-            if isinstance(self.data, pl.DataFrame):
-                # polars frames already carry exact dtypes.
-                self.output_schema = self.data.schema
-            else:
-                # head(0) converts names + typed dtypes without copying data or
-                # risking a mixed-object conversion error. An object column is
-                # element-typed only by scanning, so keep its name with an Unknown
-                # dtype rather than a guessed one. An exotic/extension dtype can
-                # still make the conversion fail, so fall back to unknown then.
-                try:
-                    schema = pl.from_pandas(self.data.head(0)).schema
-                    self.output_schema = pl.Schema({
-                        name: (_schema.UNKNOWN_DTYPE if pd.api.types.is_object_dtype(self.data[name]) else dt)
-                        for name, dt in schema.items()
-                    })
-                except Exception:
-                    logger.debug("Could not derive schema for in-memory frame; falling back to unknown.")
-                    self.output_schema = None
-            return
-
-        if isinstance(self.file_path, OperandRef) or self.format != "csv":
+            self.output_schema = _schema.schema_of_frame(self.data)
+        elif isinstance(self.file_path, OperandRef) or self.format != "csv":
             self.output_schema = None
-            return
+        else:
+            self.output_schema = self._csv_header_schema()
+
+    def _csv_header_schema(self):
+        """Column names from the CSV header (``nrows=0``), dtypes left Unknown.
+
+        Must pass this op's own ``read_args``/``read_kwargs``: several of them
+        (``sep``, ``header``, ``names``, ``usecols``, ``index_col``, ...) change the
+        resulting column set, so ignoring them would yield a confidently wrong
+        schema rather than an unknown one. That is also why the probe is pandas and
+        not ``pl.read_csv`` -- polars renames every one of those options and has no
+        ``index_col`` at all, so translating would silently drift.
+
+        Names are not necessarily strings (``header=None`` yields integer labels);
+        the ``_schema`` helpers already fall back to unknown on those.
+        """
+        read_args = tuple(self.read_args or ())
+        read_kwargs = dict(self.read_kwargs or {})
+        # A graph-fed option is still an OperandRef at plan time, so its value --
+        # and with it the column set -- isn't knowable here.
+        if any(isinstance(v, OperandRef) for v in (*read_args, *read_kwargs.values())):
+            return None
+        read_kwargs.pop("nrows", None)
         try:
-            # Read only the header (no rows): names are exact, dtypes need a full
-            # scan to be safe, so leave them Unknown.
-            names = pl.read_csv(self.file_path, n_rows=0).columns
-            self.output_schema = pl.Schema({name: _schema.UNKNOWN_DTYPE for name in names})
+            names = pd.read_csv(self.file_path, *read_args, nrows=0, **read_kwargs).columns
         except Exception:
             logger.debug("Could not derive schema for %s; falling back to unknown.", self.file_path)
-            self.output_schema = None
+            return None
+        return pl.Schema({name: _schema.UNKNOWN_DTYPE for name in names})
 
     def clone(self):
         raise ValueError(f"We should not clone DataSourceOp objects.")
