@@ -37,10 +37,15 @@ from __future__ import annotations
 
 import sys
 
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.ensemble import (ExtraTreesClassifier, ExtraTreesRegressor,
+                              HistGradientBoostingClassifier,
+                              HistGradientBoostingRegressor,
+                              RandomForestClassifier, RandomForestRegressor)
 from sklearn.linear_model import (ElasticNet, Lasso, LinearRegression,
                                   LogisticRegression, Ridge, RidgeClassifier,
                                   SGDClassifier, SGDRegressor)
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 
 from stratum.optimizer.logical._ops import PredictorOp
 from stratum.optimizer.physical._lowering import lowering_rule
@@ -57,6 +62,55 @@ class RandomForestOp(PredictorOp, PhysicalOp):
 @sklearn_skrub_impl(of=RandomForestOp)
 class SklearnRandomForest(RandomForestOp):
     """Reference impl: runs the scikit-learn forest as-is."""
+    is_abstract = False
+
+
+class ExtraTreesOp(PredictorOp, PhysicalOp):
+    """Abstract physical extremely randomized trees
+    (``ExtraTreesClassifier``/``Regressor``)."""
+    is_abstract = True
+
+
+@sklearn_skrub_impl(of=ExtraTreesOp)
+class SklearnExtraTrees(ExtraTreesOp):
+    """Reference impl: runs the scikit-learn extra-trees ensemble as-is."""
+    is_abstract = False
+
+
+# --- Decision tree -----------------------------------------------------------
+class DecisionTreeOp(PredictorOp, PhysicalOp):
+    """Abstract physical decision tree (``DecisionTreeClassifier``/``Regressor``)."""
+    is_abstract = True
+
+
+@sklearn_skrub_impl(of=DecisionTreeOp)
+class SklearnDecisionTree(DecisionTreeOp):
+    """Reference impl: runs the scikit-learn decision tree as-is."""
+    is_abstract = False
+
+
+# --- Histogram gradient boosting ----------------------------------------------
+class HistGradientBoostingOp(PredictorOp, PhysicalOp):
+    """Abstract physical histogram gradient boosting
+    (``HistGradientBoostingClassifier``/``Regressor``)."""
+    is_abstract = True
+
+
+@sklearn_skrub_impl(of=HistGradientBoostingOp)
+class SklearnHistGradientBoosting(HistGradientBoostingOp):
+    """Reference impl: runs the scikit-learn histogram gradient boosting as-is."""
+    is_abstract = False
+
+
+# --- Nearest neighbors -------------------------------------------------------
+class KNeighborsOp(PredictorOp, PhysicalOp):
+    """Abstract physical k-nearest neighbors (``KNeighborsClassifier``/``Regressor``)."""
+    is_abstract = True
+
+
+@sklearn_skrub_impl(of=KNeighborsOp)
+class SklearnKNeighbors(KNeighborsOp):
+    """Reference impl: runs the scikit-learn nearest-neighbors model as-is."""
     is_abstract = False
 
 
@@ -163,10 +217,19 @@ class LibCatBoost(CatBoostOp):
 
 # Matched on the exact type: scikit-learn subclasses these for different models
 # (``Lasso`` is an ``ElasticNet``, ``MultiTaskLasso`` a ``Lasso``,
-# ``LogisticRegressionCV`` a ``LogisticRegression``), which must stay unlowered.
+# ``LogisticRegressionCV`` a ``LogisticRegression``, ``ExtraTreeClassifier`` a
+# ``DecisionTreeClassifier``), which must stay unlowered.
 _SKLEARN_FAMILIES: dict[type, type[PredictorOp]] = {
     RandomForestClassifier: RandomForestOp,
     RandomForestRegressor: RandomForestOp,
+    ExtraTreesClassifier: ExtraTreesOp,
+    ExtraTreesRegressor: ExtraTreesOp,
+    DecisionTreeClassifier: DecisionTreeOp,
+    DecisionTreeRegressor: DecisionTreeOp,
+    HistGradientBoostingClassifier: HistGradientBoostingOp,
+    HistGradientBoostingRegressor: HistGradientBoostingOp,
+    KNeighborsClassifier: KNeighborsOp,
+    KNeighborsRegressor: KNeighborsOp,
     LinearRegression: LinearRegressionOp,
     Ridge: RidgeOp,
     RidgeClassifier: RidgeOp,
