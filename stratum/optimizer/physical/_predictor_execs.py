@@ -30,8 +30,9 @@ those for LightGBM, XGBoost and CatBoost: in the registry that backend means
 already treats as the backend-agnostic fallback.
 
 Lowering is incremental. A predictor with no family below returns ``None`` from
-:func:`lower_predictor`, passes through lowering unchanged, and keeps running via
-the ``sklearn-skrub`` impl registered on ``PredictorOp`` itself.
+:func:`lower_predictor`, passes through lowering unchanged, and is bound to
+:class:`PassthroughPredictor`, the ``sklearn-skrub`` impl registered on
+``PredictorOp`` itself, which runs any estimator (scikit-learn or not) as given.
 """
 from __future__ import annotations
 
@@ -51,6 +52,25 @@ from stratum.optimizer.logical._ops import PredictorOp
 from stratum.optimizer.physical._lowering import lowering_rule
 from stratum.optimizer.physical._physical_ops import PhysicalOp
 from stratum.optimizer.physical._registry import sklearn_skrub_impl
+
+
+# --- Pass-through ------------------------------------------------------------
+@sklearn_skrub_impl(of=PredictorOp)
+class PassthroughPredictor(PredictorOp, PhysicalOp):
+    """Impl for any predictor without a family -- scikit-learn, third-party or
+    user-defined -- that runs the estimator as-is, much like a UDF.
+
+    Renders as ``PredictorOp(<estimator>)`` so per-op stats keep pass-through
+    predictors apart; the logical op still renders as its ``Predictor`` family.
+    """
+    is_abstract = False
+
+    def to_str_helper(self):
+        _, _, is_df = super().to_str_helper()
+        estimator = " ".join(str(self.original_estimator).split())
+        if len(estimator) > 50:
+            estimator = estimator[:50] + "..."
+        return "PredictorOp", f"({estimator})", is_df
 
 
 # --- Random forest -----------------------------------------------------------

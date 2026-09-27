@@ -11,6 +11,7 @@ import sys
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.datasets import make_classification, make_regression
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestClassifier
 from sklearn.linear_model import (LassoCV, LogisticRegressionCV, MultiTaskElasticNet,
@@ -47,6 +48,7 @@ from stratum.optimizer.physical._predictor_execs import (
     LightGBMOp,
     LinearRegressionOp,
     LogisticRegressionOp,
+    PassthroughPredictor,
     RandomForestOp,
     RidgeOp,
     SGDOp,
@@ -148,6 +150,40 @@ def test_predictor_lowers_to_its_family(module, name, family, _impl):
 ], ids=lambda e: type(e).__name__)
 def test_unsupported_predictor_stays_logical(estimator):
     assert lower_predictor(PredictorOp(estimator=estimator), _ctx()) is None
+
+
+def test_pass_through_predictor_renders_its_estimator():
+    """The logical op shows its family; the bound pass-through impl names the
+    estimator, so per-op stats tell pass-through predictors apart."""
+    op = PredictorOp(estimator=RidgeCV(alphas=[0.1, 1.0]))
+    assert str(op) == "Predictor"
+
+    select_implementations(op, _ctx())
+
+    assert type(op) is PassthroughPredictor
+    assert str(op) == "PredictorOp(RidgeCV(alphas=[0.1, 1.0]))"
+
+
+class _UserDefinedPredictor(RegressorMixin, BaseEstimator):
+    """A user's own estimator, written against the scikit-learn API."""
+
+    def fit(self, X, y):
+        self.mean_ = float(np.mean(y))
+        return self
+
+    def predict(self, X):
+        return np.full(len(X), self.mean_)
+
+
+def test_any_estimator_passes_through():
+    X, y = make_regression(n_samples=20, n_features=2, random_state=0)
+    op = PredictorOp(estimator=_UserDefinedPredictor(), y=y, cols=All(), how="no_wrap")
+    select_implementations(op, _ctx())
+
+    assert type(op) is PassthroughPredictor
+    assert str(op) == "PredictorOp(_UserDefinedPredictor())"
+    np.testing.assert_array_equal(op.process("fit_transform", [X]),
+                                  np.full(len(X), np.mean(y)))
 
 
 @pytest.mark.parametrize("selector", [
