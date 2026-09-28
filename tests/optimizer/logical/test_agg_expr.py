@@ -10,7 +10,7 @@ from stratum.optimizer.logical._column_expr import (
 from stratum.optimizer.logical._ops import OperandRef
 
 # Reductions polars can express; `sem` has no polars equivalent.
-_POLARS_UNSUPPORTED = {"sem"}
+_POLARS_UNSUPPORTED = {"sem", "idxmin", "idxmax"}
 
 
 def _pandas(expr, df, inputs=()):
@@ -139,7 +139,7 @@ class TestAggExprEvaluation(unittest.TestCase):
         self.pldf = pl.DataFrame(self.data)
 
     def test_backends_agree_on_every_reduction(self):
-        # A default RangeIndex keeps idxmin/idxmax comparable across backends.
+        # Index-label reductions are deliberately not lowered to arg_min/arg_max.
         for func in sorted(AGG_PARAMS):
             with self.subTest(func=func):
                 expr = AggExpr(func, Col("a"))

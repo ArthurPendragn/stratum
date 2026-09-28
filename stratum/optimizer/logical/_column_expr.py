@@ -444,9 +444,8 @@ AGG_PARAMS = _expand_agg_params({
 # equivalent) and `nunique` is handled separately, because polars' ``n_unique``
 # counts null as a distinct value while pandas' default drops it.
 #
-# TODO: idxmin/idxmax diverge on a non-default index -- pandas returns the index
-# *label*, polars' arg_min/arg_max return the *position*. They agree only on a
-# RangeIndex. Gate or translate these once the IR tracks index metadata.
+# idxmin/idxmax require original index labels, including inside each group.
+# They are refused until an implementation can preserve that information.
 _AGG_POLARS_METHODS = {
     "sum": "sum", "prod": "product", "min": "min", "max": "max",
     "first": "first", "last": "last", "mean": "mean", "median": "median",
@@ -523,8 +522,21 @@ class AggExpr(ColumnExpr):
             return obj.iloc[0 if self.func == "first" else -1]
         return getattr(obj, self.func)(**params)
 
+    def supports_polars(self):
+        # arg_min/arg_max return positions within a group, not index labels.
+        if self.func in {"idxmin", "idxmax", "sem"}:
+            return False
+        params = {k: v for k, v in self.params.items()
+                  if _AGG_POLARS_NOOP_DEFAULTS.get(k, object()) != v}
+        allowed = {"dropna"} if self.func == "nunique" else set(_AGG_POLARS_PARAMS)
+        return not (set(params) - allowed)
+
     def to_polars(self, ctx):
+        if self.func in {"idxmin", "idxmax", "sem"}:
+            raise NotImplementedError(f"AggExpr({self.func!r}) has no equivalent Polars lowering")
         obj = self.child.to_polars(ctx)
+        if self.func in {"first", "last"} and self.params.get("skipna", True):
+            obj = obj.drop_nulls()
         params = {k: v for k, v in self.params.items()
                   if _AGG_POLARS_NOOP_DEFAULTS.get(k, object()) != v}
         if self.func == "nunique":

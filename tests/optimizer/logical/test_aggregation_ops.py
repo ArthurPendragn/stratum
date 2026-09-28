@@ -579,14 +579,14 @@ class TestValueCountsExtraction(unittest.TestCase):
         agg = make_value_counts_ops(_value_counts()).inputs[0]
         self.assertIs(False, agg.options["sort"])
 
-    def test_the_counts_are_a_series_whatever_the_source_was(self):
-        for kind in (OutputType.SERIES, OutputType.FRAME):
-            with self.subTest(source=kind.name):
-                call = _value_counts()
-                call.inputs[0].output_type = kind
-                sort = make_value_counts_ops(call)
-                self.assertIs(OutputType.SERIES, sort.output_type)
-                self.assertIs(OutputType.SERIES, sort.inputs[0].output_type)
+    def test_series_counts_are_a_series_and_frame_counts_stay_unfused(self):
+        call = _value_counts()
+        sort = make_value_counts_ops(call)
+        self.assertIs(OutputType.SERIES, sort.output_type)
+        self.assertIs(OutputType.SERIES, sort.inputs[0].output_type)
+        call = _value_counts()
+        call.inputs[0].output_type = OutputType.FRAME
+        self.assertIsNone(make_value_counts_ops(call))
 
     def test_sorting_is_a_separate_op_and_defaults_to_descending(self):
         sort = make_value_counts_ops(_value_counts())

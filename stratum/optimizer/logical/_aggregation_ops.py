@@ -1,7 +1,7 @@
 from stratum.optimizer.logical._column_expr import (
     AggExpr, AllCols, Col, OperandLeaf, _Folder)
 from stratum.optimizer.logical._ops import (
-    GetItemOp, OperandRef, OutputType, MethodCallOp, Op)
+    BinOp, UnaryOp, GetItemOp, OperandRef, OutputType, MethodCallOp, Op)
 from stratum.optimizer.logical._sort_ops import SortOp
 from stratum.optimizer.logical._projection_ops import ColumnProjectionOp
 from stratum.optimizer.logical import _schema
@@ -25,17 +25,20 @@ class AggregateOp(Op):
     ``options`` carries only the groupby options that change the *result*, e.g.
     ``sort`` (which fixes the output row order) and ``dropna``. How the
     aggregation runs is the physical layer's business and has no field here.
+    ``sort_categories`` orders categorical groups by their declared domain while
+    leaving other groups in appearance order, as required by ``value_counts``.
 
     Pure config -- execution is provided by the physical impls in
     ``physical/_aggregation_execs.py``, selected at plan time.
     """
     logical_family = "Aggregation"
-    fields = ["grouped", "grouping", "aggregations", "options"]
+    fields = ["grouped", "grouping", "aggregations", "options", "output_type"]
 
     def __init__(self, grouped: bool = False,
                  grouping: tuple = (),
                  aggregations: tuple = (),
                  options: dict | None = None,
+                 output_type: OutputType | None = None,
                  inputs: list[Op] | None = None, outputs: list[Op] | None = None):
         # The reductions go in the name so the base helper renders them for both
         # the logical family and the bound physical impl.
@@ -48,7 +51,8 @@ class AggregateOp(Op):
         self.grouping = tuple(grouping)
         self.aggregations = tuple(aggregations)
         self.options = options or {}
-        self.output_type = self.infer_output_type()
+        self.output_type = (output_type if output_type is not None
+                            else self.infer_output_type())
 
     def infer_output_type(self, src_type: OutputType | None = None) -> OutputType:
         """The kind of value this aggregation produces.
@@ -71,6 +75,8 @@ class AggregateOp(Op):
         src = src_type
         if src is None:
             src = self.inputs[0].output_type if self.inputs else OutputType.UNKNOWN
+        if self.grouped and self.options.get("as_index") is False:
+            return OutputType.FRAME
         if src is OutputType.UNKNOWN:
             return OutputType.FRAME
         if not self.grouped:
@@ -82,6 +88,13 @@ class AggregateOp(Op):
         if src is OutputType.SERIES and len(self.aggregations) > 1:
             return OutputType.FRAME
         return src
+
+    def entry_name(self, index: int):
+        """Backend-independent name for a scalar aggregation output."""
+        name, agg = self.aggregations[index]
+        if name is not None:
+            return name
+        return agg.child.name if isinstance(agg.child, Col) else f"_agg{index}"
 
     def update_name(self):
         self.name = _render_name(self.grouping, self.aggregations)
@@ -98,7 +111,9 @@ class AggregateOp(Op):
         self.output_schema = _schema.aggregate_schema(
             self.inputs[0].output_schema,
             _grouping_names(self.grouping),
-            _output_names(self.aggregations),
+            (None if any(isinstance(agg.child, AllCols)
+                         for _, agg in self.aggregations) else
+             [self.entry_name(i) for i in range(len(self.aggregations))]),
             self.options.get("as_index"),
         )
 
@@ -108,23 +123,6 @@ def _grouping_names(grouping) -> list[str] | None:
     if all(isinstance(key, Col) for key in grouping):
         return [key.name for key in grouping]
     return None
-
-
-def _output_names(aggregations) -> list[str] | None:
-    """One output column name per entry, or ``None`` when one is not static.
-
-    A wildcard entry covers whichever columns the reduction accepts at runtime,
-    and a computed child with no name of its own is named differently by each
-    backend, so neither has a name to report.
-    """
-    names = []
-    for name, agg in aggregations:
-        if name is None:
-            if not isinstance(agg.child, Col):
-                return None
-            name = agg.child.name
-        names.append(name)
-    return names
 
 
 def _render_name(grouping, aggregations) -> str:
@@ -284,9 +282,10 @@ def _aggregation_params(op: MethodCallOp) -> dict | None:
     they cannot change the result and refusing them would block an otherwise
     optimizable pipeline.
     """
-    if op.method_name in _AGG_FUNCS and len(op.args or ()) > 1:
-        # `.agg(func, *args)` forwards the extra positionals to func; dropping
-        # them would silently change the result, so leave the chain unfused.
+    if ((op.method_name in _AGG_FUNCS and len(op.args or ()) > 1)
+            or (op.method_name not in _AGG_FUNCS and op.args)):
+        # Direct methods and agg forward positional reduction parameters.
+        # Until normalized by signature, preserve the original call.
         return None
     skip = _EXECUTION_HINTS | ({_AGG_SPEC_KWARG} if op.method_name in _AGG_FUNCS
                               else set())
@@ -333,6 +332,33 @@ def _aggregation_entries(spec, params: dict, columns: tuple | None = None) -> tu
     return None
 
 
+def _expression_source(node):
+    """Find the single frame anchoring a row-wise arithmetic expression.
+
+    Cross-frame arithmetic may align indexes, so it cannot be absorbed into a
+    row-local aggregate. The folder still checks external consumers before any
+    expression node is removed.
+    """
+    if not isinstance(node, (BinOp, UnaryOp)):
+        return None
+    sources = {}
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, (ColumnProjectionOp, GetItemOp)):
+            if not isinstance(current.key, str) or not current.inputs:
+                return None
+            frame = current.inputs[0]
+            if frame.output_type is not OutputType.FRAME:
+                return None
+            sources[id(frame)] = frame
+        elif isinstance(current, (BinOp, UnaryOp)):
+            stack.extend(current.inputs)
+        else:
+            return None
+    return next(iter(sources.values())) if len(sources) == 1 else None
+
+
 def make_aggregate_op(op: MethodCallOp) -> AggregateOp | None:
     """Fuse `groupby(by)[cols].agg(...)` (or `.sum()/.mean()/...`) into an AggregateOp."""
     source = _grouped_source(op)
@@ -351,10 +377,30 @@ def make_aggregate_op(op: MethodCallOp) -> AggregateOp | None:
     if entries is None:
         return None
 
-    # One folder for the grouping keys, so a producer feeding two keys folds once
-    # and the kept leaves land in a single input list.
-    folder = _Folder(df)
-    grouping = _grouping_exprs(groupby_op, folder)
+    # Fold reduction and grouping roots together: shared column producers may
+    # be internal to both cones and must be accounted for in one discovery pass.
+    expression_source = _expression_source(df) if columns is None else None
+    computed = expression_source is not None and all(
+        isinstance(agg.child, AllCols) for _, agg in entries)
+    source_kind = df.output_type
+    if computed:
+        original = df
+        df = expression_source
+        folder = _Folder(df)
+        by = _extract_grouping(groupby_op)
+        keys = by if isinstance(by, (list, tuple)) else [by]
+        roots = [original] + [groupby_op.inputs[k.k] for k in keys
+                              if isinstance(k, OperandRef)]
+        folded = iter(folder.fold_many(roots, root_consumer=groupby_op))
+        child = next(folded)
+        grouping = tuple(next(folded) if isinstance(k, OperandRef) else Col(k)
+                         for k in keys)
+        entries = tuple((name, AggExpr(agg.func, child, agg.params))
+                        for name, agg in entries)
+        source_kind = OutputType.SERIES
+    else:
+        folder = _Folder(df)
+        grouping = _grouping_exprs(groupby_op, folder)
 
     options = {k: v for k, v in (groupby_op.kwargs or {}).items()
                if k in _GROUPBY_OPTIONS}
@@ -372,8 +418,9 @@ def make_aggregate_op(op: MethodCallOp) -> AggregateOp | None:
     )
     # A selection already narrowed the aggregation to a series; the frame below it
     # still reads as a FRAME, so take the kind from the op being absorbed.
-    if selection is not None:
-        new_op.output_type = new_op.infer_output_type(selection.output_type)
+    if selection is not None or computed:
+        new_op.output_type = new_op.infer_output_type(
+            selection.output_type if selection is not None else source_kind)
 
     _detach_and_rewire(new_op, df, folder, replaced=[groupby_op, selection, op])
     return new_op
@@ -436,6 +483,7 @@ def _is_value_counts(op: Op) -> bool:
     """
     return (isinstance(op, MethodCallOp) and op.method_name == "value_counts"
             and bool(op.inputs) and not op.args
+            and op.inputs[0].output_type is OutputType.SERIES
             and not _reads_a_groupby(op)
             and set(op.kwargs or {}) <= _VALUE_COUNTS_OPTIONS
             and not any(isinstance(v, OperandRef)
@@ -472,11 +520,11 @@ def make_value_counts_ops(op: MethodCallOp) -> Op | None:
         aggregations=(("count", AggExpr("size", values)),),
         # Unsorted on purpose (see above); `dropna` carries straight over, since
         # groupby drops null groups under the same flag and default.
-        options={"sort": False, "dropna": kwargs.get("dropna", True)},
+        options={"sort": False, "dropna": kwargs.get("dropna", True),
+                 "observed": False, "sort_categories": True},
         inputs=[src],
     )
-    # Both `series.value_counts()` and `frame.value_counts()` return a series of
-    # counts, so this does not follow the source's kind.
+    # The supported Series value_counts form returns a Series of counts.
     agg.output_type = OutputType.SERIES
     op.replace_output_of_inputs(agg)
 

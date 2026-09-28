@@ -7,12 +7,12 @@ one of these per the plan context.
 """
 from __future__ import annotations
 
+import pandas as pd
 import polars as pl
 
 from stratum.optimizer.logical._join_ops import FILTERING_JOINS, JoinOp
 from stratum.optimizer.physical._physical_ops import PhysicalOp
 from stratum.optimizer.physical._registry import physical_impl
-
 
 @physical_impl(of=JoinOp, backend="pandas")
 class PandasJoinOp(JoinOp, PhysicalOp):
@@ -35,7 +35,6 @@ class PandasJoinOp(JoinOp, PhysicalOp):
             left_index=self.left_index,
             right_index=self.right_index,
         )
-
 
 @physical_impl(of=JoinOp, backend="polars")
 class PolarsJoinOp(JoinOp, PhysicalOp):
@@ -89,12 +88,8 @@ class PolarsJoinOp(JoinOp, PhysicalOp):
 
 # --- Filtering joins (semi / anti) --------------------------------------------
 #
-# The two pandas impls split on a *correctness* boundary rather than a cost
-# guess: `isin` tests one column against one sequence of values, so it cannot
-# express a composite key at all, and a multi-key filtering join has to go
-# through a merge on the de-duplicated build side. De-duplicating is what keeps
-# it a semi-join rather than an inner join, since a build row matching twice
-# must not double a left row.
+# Single-key joins admit both implementations. Composite keys require merge;
+# de-duplicating the build keys preserves the multiplicity of each left row.
 
 
 class FilteringJoinExec(JoinOp, PhysicalOp):
@@ -104,45 +99,64 @@ class FilteringJoinExec(JoinOp, PhysicalOp):
     def _keep_matches(self) -> bool:
         return self.how == "semi"
 
-
 @physical_impl(of=JoinOp, backend="pandas")
 class PandasIsInSemiJoinOp(FilteringJoinExec):
     """Single-key filtering join through ``Series.isin``."""
 
     @classmethod
     def supports(cls, op: JoinOp, ctx) -> bool:
-        return (op.how in FILTERING_JOINS and isinstance(op.left_on, str)
+        single_left = (isinstance(op.left_on, str)
+                       or isinstance(op.left_on, (list, tuple)) and len(op.left_on) == 1)
+        single_right = (op.right_on is None or isinstance(op.right_on, str)
+                        or isinstance(op.right_on, (list, tuple)) and len(op.right_on) == 1)
+        return (op.how in FILTERING_JOINS and single_left and single_right
                 and not op.left_index and not op.right_index)
 
     def process(self, mode: str, inputs: list):
         left, build = inputs
         if self.right_on is not None:
-            build = build[self.right_on]
-        mask = left[self.left_on].isin(build)
+            key = self.right_on if isinstance(self.right_on, str) else self.right_on[0]
+            build = build[key]
+        key = self.left_on if isinstance(self.left_on, str) else self.left_on[0]
+        mask = left[key].isin(build)
         return left[mask if self._keep_matches else ~mask]
-
 
 @physical_impl(of=JoinOp, backend="pandas")
 class PandasMergeSemiJoinOp(FilteringJoinExec):
-    """Composite-key filtering join through a merge on de-duplicated keys."""
+    """Filtering join through a merge on de-duplicated keys, at any arity."""
 
     @classmethod
     def supports(cls, op: JoinOp, ctx) -> bool:
-        return (op.how in FILTERING_JOINS
-                and isinstance(op.left_on, (list, tuple))
-                and isinstance(op.right_on, (list, tuple))
-                and len(op.left_on) == len(op.right_on)
+        left_keys = [op.left_on] if isinstance(op.left_on, str) else op.left_on
+        right_keys = [op.right_on] if isinstance(op.right_on, str) else op.right_on
+        return (op.how in FILTERING_JOINS and bool(left_keys)
+                and (right_keys is None and len(left_keys) == 1
+                     or right_keys is not None and len(left_keys) == len(right_keys))
                 and not op.left_index and not op.right_index)
 
     def process(self, mode: str, inputs: list):
         left, build = inputs
-        keys = build[list(self.right_on)].drop_duplicates()
-        keys.columns = list(self.left_on)
-        # De-duplicated keys mean a left row matches at most once, so the merge
-        # preserves row order and count and the indicator lines up positionally.
-        merged = left.merge(keys, on=list(self.left_on), how="left",
-                            indicator=True)
-        matched = (merged["_merge"].to_numpy() == "both")
+        left_keys = [self.left_on] if isinstance(self.left_on, str) else list(self.left_on)
+        right_keys = ([self.right_on] if isinstance(self.right_on, str)
+                      else self.right_on)
+        # Only keys enter the temporary merge, so user payload names (including
+        # _merge) cannot collide with the indicator. Keep the original index.
+        probe = left[left_keys].copy()
+        keys = (pd.DataFrame({0: build.array if isinstance(build, (pd.Series, pd.Index))
+                             else pd.Series(list(build), dtype=object)}) if right_keys is None
+                else build[list(right_keys)].copy())
+        probe.columns = keys.columns = list(range(len(left_keys)))
+        # For a single key, handle missing sentinels with isin separately.
+        # Otherwise distinct None/NaN/NA build values can multiply merge rows.
+        merge_keys = keys.loc[keys[0].notna()] if len(left_keys) == 1 else keys
+        merged = probe.merge(merge_keys.drop_duplicates(), how="left", sort=False,
+                             on=list(probe.columns), indicator=True)
+        matched = merged["_merge"].to_numpy() == "both"
+        if len(left_keys) == 1:
+            # pandas merge equates all missing sentinels, whereas isin on an
+            # object Series distinguishes None, NaN and pd.NA.
+            missing = probe[0].isna().to_numpy()
+            matched[missing] = probe.loc[missing, 0].isin(keys[0]).to_numpy()
         return left[matched if self._keep_matches else ~matched]
 
 
@@ -169,4 +183,5 @@ class PolarsFilteringJoinOp(FilteringJoinExec):
         else:
             right_on = ([self.right_on] if isinstance(self.right_on, str)
                         else list(self.right_on))
-        return left.join(build, left_on=left_on, right_on=right_on, how=self.how)
+        return left.join(build, left_on=left_on, right_on=right_on, how=self.how,
+                         nulls_equal=True, maintain_order="left")

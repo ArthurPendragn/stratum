@@ -751,13 +751,13 @@ class TestSchemaPropagation(unittest.TestCase):
         op.propagate_output_schema()
         self.assertIsNone(op.output_schema)
 
-    def test_aggregate_unnamed_computed_child_is_unknown(self):
-        # each backend names an unnamed computed entry differently.
+    def test_aggregate_unnamed_computed_child_has_a_logical_name(self):
+        # Every backend uses the name fixed by the logical aggregation.
         child = BinOpExpr(operator.mul, Col("a"), Col("b"))
         op = self._aggregate(((None, AggExpr("sum", child)),))
         op.inputs = [_stub(pl.Schema({"g": pl.Int64, "a": pl.Int64, "b": pl.Int64}))]
         op.propagate_output_schema()
-        self.assertIsNone(op.output_schema)
+        self.assertEqual(pl.Schema({"_agg0": pl.Unknown}), op.output_schema)
 
     def test_aggregate_duplicate_output_name_is_unknown(self):
         op = self._aggregate((("v", AggExpr("sum", Col("v"))),

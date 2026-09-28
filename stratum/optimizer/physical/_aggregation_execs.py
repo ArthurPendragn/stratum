@@ -13,6 +13,7 @@ into a working frame first and then reduces it per column.
 from __future__ import annotations
 
 import pandas as pd
+import polars as pl
 
 from stratum.optimizer.logical._aggregation_ops import AggregateOp
 from stratum.optimizer.logical._base import OutputType
@@ -26,19 +27,6 @@ class AggregateExec(AggregateOp, PhysicalOp):
 
     def _ctx(self, inputs: list, mode: str) -> EvalContext:
         return EvalContext(frame=inputs[0], inputs=inputs, mode=mode)
-
-    def _entry_name(self, index: int) -> str:
-        """Output name for entry ``index``.
-
-        An explicit name wins. Otherwise the name comes from the entry's own
-        expression, so ``groupby(k)["v"].sum()`` still produces a ``v`` and not an
-        internal placeholder. Only a computed child with no name of its own falls
-        back to a generated one.
-        """
-        name, agg = self.aggregations[index]
-        if name is not None:
-            return name
-        return agg.child.name if isinstance(agg.child, Col) else f"_agg{index}"
 
 
 @physical_impl(of=AggregateOp, backend="pandas")
@@ -54,7 +42,7 @@ class PandasAggregateOp(AggregateExec):
         if self._is_wildcard_only():
             _, agg = self.aggregations[0]
             return agg.to_pandas(ctx)
-        results = {self._entry_name(i): agg.to_pandas(ctx)
+        results = {self.entry_name(i): agg.to_pandas(ctx)
                    for i, (_, agg) in enumerate(self.aggregations)}
         if self.output_type is OutputType.SERIES:
             return pd.Series(results)
@@ -63,6 +51,7 @@ class PandasAggregateOp(AggregateExec):
     def _reduce_grouped(self, ctx: EvalContext):
         keys = [expr.to_pandas(ctx) for expr in self.grouping]
         options = dict(self.options)
+        sort_categories = options.pop("sort_categories", False)
         options.pop("level", None)  # a level-based grouping is carried by `keys`
         if self._is_wildcard_only():
             # `.agg(func)` on the grouped frame keeps pandas' own column naming
@@ -74,26 +63,42 @@ class PandasAggregateOp(AggregateExec):
         columns: dict = {}
         for index, (_, agg) in enumerate(self.aggregations):
             columns.setdefault(agg.child, f"_child{index}")
-        work = pd.DataFrame({name: child.to_pandas(ctx)
+        materialized = {child: child.to_pandas(ctx) for child in columns}
+        work = pd.DataFrame({name: materialized[child]
                              for child, name in columns.items()})
-        grouped = work.groupby(keys, **options)
+        as_index = options.pop("as_index", True)
+        grouped = work.groupby(keys, as_index=True, **options)
         out = {}
         for index, (_, agg) in enumerate(self.aggregations):
             series = grouped[columns[agg.child]]
-            out[self._entry_name(index)] = getattr(series, agg.func)(**agg.params)
+            reduced = getattr(series, agg.func)(**agg.params)
+            if sort_categories and isinstance(reduced.index, pd.CategoricalIndex):
+                reduced = reduced.sort_index()
+            out[self.entry_name(index)] = reduced
         if self.output_type is OutputType.SERIES and len(out) == 1:
             # A single-column result keeps its name; `grouped[...]` carries the
             # internal working-frame name, so rename it back.
             name, series = next(iter(out.items()))
+            explicit, agg = self.aggregations[0]
+            if explicit is None and not isinstance(agg.child, Col):
+                name = getattr(materialized[agg.child], "name", name)
             return series.rename(name)
-        return pd.DataFrame(out)
+        result = pd.DataFrame(out)
+        if as_index:
+            return result
+        # pandas omits a grouping key when a reduction already produces that
+        # label, rather than creating duplicate output columns.
+        levels = [i for i, name in enumerate(result.index.names)
+                  if name not in result.columns]
+        if levels:
+            result = result.reset_index(level=levels)
+        return result.reset_index(drop=True)
 
     def _is_wildcard_only(self) -> bool:
         """A single unnamed entry over every column, i.e. a plain ``.agg(func)``."""
         return (len(self.aggregations) == 1
                 and self.aggregations[0][0] is None
                 and isinstance(self.aggregations[0][1].child, AllCols))
-
 
 @physical_impl(of=AggregateOp, backend="polars")
 class PolarsAggregateOp(AggregateExec):
@@ -107,18 +112,26 @@ class PolarsAggregateOp(AggregateExec):
         value rather than an expression, so the aggregation would silently stop
         being one kernel. Refusing here turns that into a plan-time decision.
         """
-        return not (op.inputs
-                    and op.inputs[0].output_type is OutputType.SERIES)
+        if op.output_type is not OutputType.FRAME:
+            return False
+        if op.inputs and op.inputs[0].output_type is OutputType.SERIES:
+            return False
+        # Polars has no pandas index labels or unobserved categorical groups.
+        if op.options.get("observed") is False or op.options.get("level") is not None:
+            return False
+        return all(agg.supports_polars() for _, agg in op.aggregations)
 
     def process(self, mode: str, inputs: list):
-        ctx = self._ctx(inputs, mode)
+        # pandas treats floating NaN as missing for grouping and reductions.
+        frame = inputs[0].with_columns(pl.col(pl.Float32, pl.Float64).fill_nan(None))
+        ctx = self._ctx([frame, *inputs[1:]], mode)
         exprs = []
         for index, (name, agg) in enumerate(self.aggregations):
             expr = agg.to_polars(ctx)
             # A wildcard keeps one output per source column, so it must not be
             # collapsed under a single alias.
-            if name is not None:
-                expr = expr.alias(name)
+            if not isinstance(agg.child, AllCols):
+                expr = expr.alias(self.entry_name(index))
             exprs.append(expr)
         if not self.grouped:
             return ctx.frame.select(exprs)
@@ -126,7 +139,10 @@ class PolarsAggregateOp(AggregateExec):
         # pandas sorts the group keys by default; polars neither sorts nor
         # preserves order unless asked, so both cases are made explicit.
         sort = self.options.get("sort", True)
-        result = ctx.frame.group_by(keys, maintain_order=not sort).agg(exprs)
+        frame = ctx.frame
+        if self.options.get("dropna", True):
+            frame = frame.filter(pl.all_horizontal([key.is_not_null() for key in keys]))
+        result = frame.group_by(keys, maintain_order=not sort).agg(exprs)
         if sort:
-            result = result.sort(result.columns[:len(keys)])
+            result = result.sort(result.columns[:len(keys)], nulls_last=True)
         return result
