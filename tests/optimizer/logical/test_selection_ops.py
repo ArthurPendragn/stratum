@@ -302,6 +302,55 @@ class TestMaskFolding(unittest.TestCase):
         self.assertTrue(any(isinstance(o, ColumnProjectionOp) for o in ops))  # column kept
 
 
+class TestSeriesMaskFolding(unittest.TestCase):
+    """A series is as filterable as a frame: `counts[counts >= 3]` folds too."""
+
+    def setUp(self):
+        self.df = pd.DataFrame({"v": [1, 5, 3, 2], "w": [9, 8, 7, 6]})
+
+    def _mask(self, ops):
+        masks = [o for o in ops if isinstance(o, SelectionOp)
+                 and o.kind is SelectionKind.MASK]
+        self.assertEqual(1, len(masks), "expected exactly one mask SelectionOp")
+        return masks[0]
+
+    def _filtered(self):
+        data = st.as_data_op(self.df)
+        series = data["v"]
+        return optimize(series[series >= 3], OptConfig(dataframe_ops=True))
+
+    def test_a_masked_series_folds_and_stays_a_series(self):
+        sel = self._mask(self._filtered())
+        self.assertIs(OutputType.SERIES, sel.output_type)
+
+    def test_the_series_refers_to_itself_through_operand_zero(self):
+        # The predicate's subject *is* the source, which the folder spells as the
+        # operand-zero leaf rather than a named column.
+        sel = self._mask(self._filtered())
+        self.assertEqual(BinOpExpr(operator.ge, OperandLeaf(OperandRef(0)), Const(3)),
+                         sel.predicate)
+
+    def test_it_executes_like_plain_pandas(self):
+        ops = self._filtered()
+        pool_values = {}
+        for op in ops:
+            pool_values[id(op)] = op.process(
+                "fit_transform", [pool_values[id(i)] for i in op.inputs])
+        expected = self.df["v"][self.df["v"] >= 3]
+        pd.testing.assert_series_equal(pool_values[id(ops[-1])], expected)
+
+    def test_the_query_fast_path_is_frame_only(self):
+        # `DataFrame.query` has no series spelling, so a masked series must never
+        # be routed to it even with the flag on.
+        from stratum.optimizer.physical._selection_execs import _query_selectable
+        sel = self._mask(self._filtered())
+        sel.output_type = OutputType.FRAME
+        sel.predicate = BinOpExpr(operator.ge, Col("v"), Const(3))
+        self.assertTrue(_query_selectable(sel))
+        sel.output_type = OutputType.SERIES
+        self.assertFalse(_query_selectable(sel))
+
+
 class TestColumnExprOperandRefs(unittest.TestCase):
     """The ref-traversal contract validate_dag / CSE rely on to descend into exprs."""
 

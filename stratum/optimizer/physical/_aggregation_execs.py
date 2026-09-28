@@ -97,6 +97,19 @@ class PandasAggregateOp(AggregateExec):
 
 @physical_impl(of=AggregateOp, backend="polars")
 class PolarsAggregateOp(AggregateExec):
+
+    @classmethod
+    def supports(cls, op: AggregateOp, ctx) -> bool:
+        """Refuse a series source: polars has no expression context for one.
+
+        Both paths below start from ``select``/``group_by`` on the source, and a
+        ``pl.Series`` has neither. Reducing it directly would return a Python
+        value rather than an expression, so the aggregation would silently stop
+        being one kernel. Refusing here turns that into a plan-time decision.
+        """
+        return not (op.inputs
+                    and op.inputs[0].output_type is OutputType.SERIES)
+
     def process(self, mode: str, inputs: list):
         ctx = self._ctx(inputs, mode)
         exprs = []

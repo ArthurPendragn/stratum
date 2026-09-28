@@ -8,9 +8,13 @@ from stratum.optimizer._optimize import OptConfig
 from stratum.optimizer.logical._aggregation_ops import (
     AggregateOp, _aggregation_entries, _aggregation_params,
     _extract_aggregations, _extract_grouping, _is_aggregation, _is_groupby_op,
-    make_aggregate_op)
+    _is_value_counts, make_aggregate_op, make_value_counts_ops)
 from stratum.optimizer.logical._column_expr import (
     AggExpr, AllCols, BinOpExpr, Col, DtExpr, OperandLeaf)
+from stratum.optimizer.logical._projection_ops import (
+    ColumnProjectionOp, GetAttrProjectionOp, MetadataOp)
+from stratum.optimizer.logical._selection_ops import SelectionKind, SelectionOp
+from stratum.optimizer.logical._sort_ops import SortOp
 from stratum.optimizer.logical._source_ops import DataSourceOp
 from stratum.optimizer.logical._ops import MethodCallOp, Op, OperandRef, OutputType
 from stratum.runtime._buffer_pool import BufferPool
@@ -317,15 +321,19 @@ class TestAggregateHelpers(unittest.TestCase):
         self.assertIsNone(make_aggregate_op(agg))
 
 
+def _run_plan(ops):
+    """Execute an extracted plan in order and return the last op's value."""
+    pool = BufferPool()
+    for op in ops:
+        inputs = [pool.pin(key) for key in op.inputs]
+        pool.put(op, op.process("fit_transform", inputs))
+    return pool.pin(ops[-1])
+
+
 class TestAggregateRewrites(unittest.TestCase):
     """End-to-end: skrub `groupby(...).agg(...)` expressions fuse into AggregateOp."""
 
-    def _run_plan(self, ops):
-        pool = BufferPool()
-        for op in ops:
-            inputs = [pool.pin(key) for key in op.inputs]
-            pool.put(op, op.process("fit_transform", inputs))
-        return pool.pin(ops[-1])
+    _run_plan = staticmethod(_run_plan)
 
     def setUp(self):
         self.df = pd.DataFrame({
@@ -527,6 +535,179 @@ class TestAggregateRewrites(unittest.TestCase):
         result = self._run_plan(ops)
         expected = df.groupby(df["d"].dt.year).agg({"v": "sum"})
         pd.testing.assert_frame_equal(result, expected)
+
+
+def _value_counts(**kwargs) -> MethodCallOp:
+    """A `value_counts(**kwargs)` call over a series source."""
+    call = MethodCallOp("value_counts", args=(), kwargs=kwargs)
+    call.inputs = [_src(OutputType.SERIES)]
+    call.inputs[0].outputs = [call]
+    return call
+
+
+class TestPolarsRefusesASeriesSource(unittest.TestCase):
+    """polars has no expression context for a series, so it opts out at plan time."""
+
+    def _agg(self, src_kind):
+        return AggregateOp(grouped=True, inputs=[_src(src_kind)])
+
+    def test_a_series_source_is_refused_and_a_frame_source_is_not(self):
+        from stratum.optimizer.physical._aggregation_execs import PolarsAggregateOp
+        self.assertFalse(PolarsAggregateOp.supports(
+            self._agg(OutputType.SERIES), None))
+        self.assertTrue(PolarsAggregateOp.supports(
+            self._agg(OutputType.FRAME), None))
+
+    def test_the_pandas_impl_takes_a_series_source(self):
+        from stratum.optimizer.physical._aggregation_execs import PandasAggregateOp
+        self.assertTrue(PandasAggregateOp.supports(
+            self._agg(OutputType.SERIES), None))
+
+
+class TestValueCountsExtraction(unittest.TestCase):
+    """`value_counts()` becomes a grouped count keyed on the values, plus a sort."""
+
+    def test_the_grouping_key_is_the_source_itself(self):
+        sort = make_value_counts_ops(_value_counts())
+        agg = sort.inputs[0]
+        values = OperandLeaf(OperandRef(0))
+        self.assertEqual((values,), agg.grouping)
+        self.assertEqual((("count", AggExpr("size", values)),), agg.aggregations)
+
+    def test_the_groupby_runs_unsorted_so_the_sort_can_break_ties(self):
+        # A key-sorted groupby would replace pandas' first-appearance tie order.
+        agg = make_value_counts_ops(_value_counts()).inputs[0]
+        self.assertIs(False, agg.options["sort"])
+
+    def test_the_counts_are_a_series_whatever_the_source_was(self):
+        for kind in (OutputType.SERIES, OutputType.FRAME):
+            with self.subTest(source=kind.name):
+                call = _value_counts()
+                call.inputs[0].output_type = kind
+                sort = make_value_counts_ops(call)
+                self.assertIs(OutputType.SERIES, sort.output_type)
+                self.assertIs(OutputType.SERIES, sort.inputs[0].output_type)
+
+    def test_sorting_is_a_separate_op_and_defaults_to_descending(self):
+        sort = make_value_counts_ops(_value_counts())
+        self.assertIsInstance(sort, SortOp)
+        self.assertEqual((), sort.by)          # a series orders by its own values
+        self.assertIs(False, sort.ascending)
+        self.assertIs(True, make_value_counts_ops(
+            _value_counts(ascending=True)).ascending)
+
+    def test_sort_false_yields_the_aggregation_alone(self):
+        op = make_value_counts_ops(_value_counts(sort=False))
+        self.assertIsInstance(op, AggregateOp)
+
+    def test_dropna_is_carried_to_the_groupby(self):
+        for dropna in (True, False):
+            with self.subTest(dropna=dropna):
+                agg = make_value_counts_ops(_value_counts(dropna=dropna)).inputs[0]
+                self.assertIs(dropna, agg.options["dropna"])
+
+    def test_options_without_a_spelling_here_are_refused(self):
+        # normalize is a ratio not a reduction, bins buckets the values first,
+        # and subset groups by some columns instead of all of them.
+        for kwargs in ({"normalize": True}, {"bins": 3}, {"subset": ["a"]}):
+            with self.subTest(**kwargs):
+                self.assertFalse(_is_value_counts(_value_counts(**kwargs)))
+                self.assertIsNone(make_value_counts_ops(_value_counts(**kwargs)))
+
+    def test_graph_fed_and_positional_calls_are_refused(self):
+        self.assertFalse(_is_value_counts(_value_counts(dropna=OperandRef(1))))
+        positional = MethodCallOp("value_counts", args=(True,), kwargs={})
+        positional.inputs = [_src(OutputType.SERIES)]
+        self.assertFalse(_is_value_counts(positional))
+
+    def test_a_call_with_no_input_is_not_a_value_counts(self):
+        self.assertFalse(_is_value_counts(MethodCallOp("value_counts", args=(),
+                                                       kwargs={})))
+
+    def test_a_grouped_value_counts_is_refused(self):
+        # A second grouping level counted and ordered within each group is a
+        # different computation; the plain groupby path already runs it.
+        for selection in (None, ColumnProjectionOp(key="v")):
+            with self.subTest(selection=selection is not None):
+                groupby = MethodCallOp("groupby", args=("g",), kwargs={})
+                call = MethodCallOp("value_counts", args=(), kwargs={})
+                chain = [groupby] if selection is None else [groupby, selection]
+                for producer, consumer in zip(chain, chain[1:] + [call]):
+                    consumer.inputs = [producer]
+                    producer.outputs = [consumer]
+                self.assertFalse(_is_value_counts(call))
+                self.assertIsNone(make_value_counts_ops(call))
+
+
+class TestValueCountsPipeline(unittest.TestCase):
+    """End to end: the `value_counts` filter pipeline that motivates #195."""
+
+    _run_plan = staticmethod(_run_plan)
+
+    def setUp(self):
+        # `c` and `e` tie on 3, and `c` appears first, so the tie order pandas
+        # produces differs from the one a key-sorted groupby would.
+        self.df = pd.DataFrame({
+            "t": ["c"] * 2 + ["a"] * 5 + ["b"] * 4 + ["c"] + ["d"] + ["e"] * 3,
+            "x": range(16),
+        })
+
+    def test_value_counts_matches_pandas_including_tie_order(self):
+        ops = optimize(st.as_data_op(self.df)["t"].value_counts(),
+                       OptConfig(dataframe_ops=True))
+        self.assertEqual(1, len([o for o in ops if isinstance(o, AggregateOp)]))
+        self.assertEqual(1, len([o for o in ops if isinstance(o, SortOp)]))
+        pd.testing.assert_series_equal(self._run_plan(ops),
+                                       self.df["t"].value_counts())
+
+    def test_a_grouped_value_counts_stays_unfused_and_still_runs(self):
+        data = st.as_data_op(self.df).groupby("t")["x"].value_counts()
+        ops = optimize(data, OptConfig(dataframe_ops=True))
+        self.assertEqual([], [o for o in ops if isinstance(o, AggregateOp)])
+        pd.testing.assert_series_equal(
+            self._run_plan(ops), self.df.groupby("t")["x"].value_counts())
+
+    def test_value_counts_without_sorting_skips_the_sort_op(self):
+        ops = optimize(st.as_data_op(self.df)["t"].value_counts(sort=False),
+                       OptConfig(dataframe_ops=True))
+        self.assertEqual([], [o for o in ops if isinstance(o, SortOp)])
+        pd.testing.assert_series_equal(self._run_plan(ops),
+                                       self.df["t"].value_counts(sort=False))
+
+    def _plan(self):
+        def build(frame):
+            target = frame["t"]
+            counts = target.value_counts()
+            eligible = counts[counts >= 3].index
+            return frame[target.isin(eligible)].reset_index(drop=True)
+        return (optimize(build(st.as_data_op(self.df)), OptConfig(dataframe_ops=True)),
+                build(self.df))
+
+    def test_the_driving_pipeline_extracts_and_matches_pandas(self):
+        ops, expected = self._plan()
+        pd.testing.assert_frame_equal(self._run_plan(ops), expected)
+
+    def test_every_gap_in_the_pipeline_is_extracted(self):
+        ops, _ = self._plan()
+        kinds = [type(o) for o in ops]
+        self.assertEqual(1, sum(issubclass(k, AggregateOp) for k in kinds))
+        self.assertEqual(1, sum(issubclass(k, SortOp) for k in kinds))
+        self.assertEqual(1, sum(issubclass(k, GetAttrProjectionOp) for k in kinds))
+        self.assertEqual(1, sum(issubclass(k, MetadataOp) for k in kinds))
+        # The counts filter is a mask over a *series*, which used to be refused.
+        # The other mask is the frame filter, whose `isin` predicate is a column
+        # method (#213) until #196 promotes it to a semi-join.
+        masks = [o for o in ops if isinstance(o, SelectionOp)
+                 and o.kind is SelectionKind.MASK]
+        self.assertEqual([OutputType.FRAME, OutputType.SERIES],
+                         sorted((m.output_type for m in masks), key=lambda t: t.name))
+
+    def test_no_raw_method_call_is_left(self):
+        # `isin` is extracted as a column method (#213), so every call in the
+        # pipeline is now a frame operator.
+        ops, _ = self._plan()
+        leftover = [o.method_name for o in ops if type(o) is MethodCallOp]
+        self.assertEqual([], leftover)
 
 
 if __name__ == "__main__":

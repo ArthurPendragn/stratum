@@ -1,6 +1,8 @@
-from stratum.optimizer.logical._column_expr import AggExpr, AllCols, Col, _Folder
+from stratum.optimizer.logical._column_expr import (
+    AggExpr, AllCols, Col, OperandLeaf, _Folder)
 from stratum.optimizer.logical._ops import (
     GetItemOp, OperandRef, OutputType, MethodCallOp, Op)
+from stratum.optimizer.logical._sort_ops import SortOp
 from stratum.optimizer.logical._projection_ops import ColumnProjectionOp
 from stratum.optimizer.logical import _schema
 
@@ -398,3 +400,92 @@ def _detach_and_rewire(new_op: AggregateOp, df: Op, folder: _Folder,
     for node in replaced:
         if node is not None and node is not new_op:
             node.inputs = []
+
+
+# --- value_counts -------------------------------------------------------------
+
+# `value_counts` options that map onto the aggregation. The rest have no spelling
+# here: `normalize` is a ratio rather than a reduction, `bins` buckets the values
+# first, and `subset` groups by some columns instead of all of them. A call using
+# one of those is left unfused rather than mis-modelled.
+_VALUE_COUNTS_OPTIONS = {"sort", "ascending", "dropna"}
+
+
+def _reads_a_groupby(op: Op) -> bool:
+    """Whether ``op`` consumes a groupby, directly or through a column selection.
+
+    Unlike :func:`_grouped_source` this asks only about the shape, with no
+    single-consumer gate, because it is used to *refuse* rather than to fuse: a
+    grouped call must be left alone whether or not the groupby is shared.
+    """
+    if not op.inputs:
+        return False
+    node = op.inputs[0]
+    if _is_groupby_op(node):
+        return True
+    return (isinstance(node, (ColumnProjectionOp, GetItemOp))
+            and bool(node.inputs) and _is_groupby_op(node.inputs[0]))
+
+
+def _is_value_counts(op: Op) -> bool:
+    """True for a ``value_counts()`` call this module can fuse.
+
+    A *grouped* ``value_counts`` is a different computation (a second grouping
+    level, counted and ordered within each group) and is left unfused, where the
+    plain groupby path already handles it correctly.
+    """
+    return (isinstance(op, MethodCallOp) and op.method_name == "value_counts"
+            and bool(op.inputs) and not op.args
+            and not _reads_a_groupby(op)
+            and set(op.kwargs or {}) <= _VALUE_COUNTS_OPTIONS
+            and not any(isinstance(v, OperandRef)
+                        for v in (op.kwargs or {}).values()))
+
+
+def make_value_counts_ops(op: MethodCallOp) -> Op | None:
+    """Fuse ``value_counts()`` into an aggregation, followed by a sort when it orders.
+
+    No special case is needed in the op itself: ``value_counts`` is a grouped
+    count keyed on the values being counted, and "the source itself" is already
+    spelled in the grammar as ``OperandLeaf(OperandRef(0))`` -- the same leaf the
+    folder produces for a node that *is* the source.
+
+    The groupby deliberately runs unsorted with an explicit :class:`SortOp` after
+    it, rather than reusing the groupby's own key sort. That is what reproduces
+    pandas: ``value_counts`` leaves equally frequent values in order of first
+    appearance, which a key-sorted groupby would replace with key order. Keeping
+    the ordering as its own operator is also what lets a later rewrite drop it
+    when the consumer never observes row order.
+
+    Returns the op downstream consumers should read (the sort, or the aggregation
+    when ``sort=False``), or ``None`` when the call cannot be represented.
+    """
+    if not _is_value_counts(op):
+        return None
+    kwargs = op.kwargs or {}
+    src = op.inputs[0]
+
+    values = OperandLeaf(OperandRef(0))
+    agg = AggregateOp(
+        grouped=True,
+        grouping=(values,),
+        aggregations=(("count", AggExpr("size", values)),),
+        # Unsorted on purpose (see above); `dropna` carries straight over, since
+        # groupby drops null groups under the same flag and default.
+        options={"sort": False, "dropna": kwargs.get("dropna", True)},
+        inputs=[src],
+    )
+    # Both `series.value_counts()` and `frame.value_counts()` return a series of
+    # counts, so this does not follow the source's kind.
+    agg.output_type = OutputType.SERIES
+    op.replace_output_of_inputs(agg)
+
+    if not kwargs.get("sort", True):
+        agg.outputs = list(op.outputs)
+        return agg
+    # The counts are the series' own values, so the sort needs no key.
+    sort = SortOp(ascending=kwargs.get("ascending", False),
+                  inputs=[agg], outputs=list(op.outputs))
+    sort.output_type = OutputType.SERIES
+    agg.outputs = [sort]
+    return sort

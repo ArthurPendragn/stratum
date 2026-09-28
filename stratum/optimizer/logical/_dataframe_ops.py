@@ -16,13 +16,15 @@ from stratum.optimizer.logical._selection_ops import (
     is_mask_selection, make_mask_selection_op)
 from stratum.optimizer.logical._aggregation_ops import (
     AggregateOp, GroupedDataframeOp, _AGG_METHODS, _AGG_FUNCS, _is_groupby_op,
-    _is_aggregation, _extract_grouping, _extract_aggregations, make_aggregate_op)
+    _is_aggregation, _is_value_counts, _extract_grouping, _extract_aggregations,
+    make_aggregate_op, make_value_counts_ops)
+from stratum.optimizer.logical._sort_ops import SortOp
 from stratum.optimizer.logical._projection_ops import (
     ColumnProjectionOp, ColumnSelectorOp, MetadataOp, ProjectionOp, DropOp,
     ApplyUDFOp, AssignOp, DatetimeConversionOp, GetAttrProjectionOp,
     StringMethodOp, make_column_projection_op, make_column_selector_op,
-    make_datetime_conversion_op, make_frame_get_attr, make_string_method_op,
-    resolve_selector_columns)
+    make_datetime_conversion_op, make_frame_get_attr, make_reset_index_op,
+    make_string_method_op, resolve_selector_columns)
 from stratum.optimizer.logical._map_ops import MapOp, AssignMapOp, make_assign_map_op
 from stratum.optimizer.logical._column_methods import (
     ColumnMethodOp, is_supported_column_method, make_column_method_op)
@@ -171,6 +173,12 @@ def extract_dataframe_op(op: Op, root: Op, selection_op = True, map_op = True,
                 op.output_type = OutputType.FRAME
             elif _is_aggregation(op):
                 new_op = make_aggregate_op(op)
+            elif _is_value_counts(op):
+                # Expands to an aggregation plus a sort, and returns the sort;
+                # the caller rewires this op's consumers onto whatever comes back.
+                new_op = make_value_counts_ops(op)
+            elif op.method_name == "reset_index":
+                new_op = make_reset_index_op(op)
             elif op.method_name in ["rename"]:
                 new_op = MetadataOp(func=op.method_name, args=op.args, kwargs=op.kwargs, inputs=op.inputs,
                                     outputs=op.outputs)
