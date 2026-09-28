@@ -21,6 +21,7 @@ def test_native_extension_exports_expected_api():
         "_TfidfModelHandle",
         "_TruncatedSvdModelHandle",
         "_TreeModelHandle",
+        "_ForestModelHandle",
         "csr_to_dense",
         "fd_fit_from_csr",
         "fd_transform_from_csr",
@@ -35,6 +36,10 @@ def test_native_extension_exports_expected_api():
         "tree_model_arrays",
         "tree_model_from_arrays",
         "tree_predict",
+        "forest_fit_exact",
+        "forest_fit_hist",
+        "forest_model_info",
+        "forest_predict",
     }
 
     actual = {name for name in dir(rb.native) if not name.startswith("__")}

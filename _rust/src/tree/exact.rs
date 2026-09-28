@@ -1,13 +1,11 @@
 use super::builder::{NodeStats, Split, SplitFinder, SplitSearch};
-use super::rng::SklearnRng;
+use super::feature_sampling::FeatureSampler;
 
 const FEATURE_THRESHOLD: f32 = 1.0e-7;
 
 // Exact sklearn-style split search with deterministic feature sampling.
 pub(crate) struct ExactSplitFinder {
-    features: Vec<usize>,
-    rng: SklearnRng,
-    max_features: usize,
+    feature_sampler: FeatureSampler,
     min_samples_leaf: usize,
     min_weight_leaf: f64,
     sorted: Vec<(f32, usize)>,
@@ -26,9 +24,7 @@ impl ExactSplitFinder {
         min_weight_leaf: f64,
     ) -> Self {
         Self {
-            features: (0..n_features).collect(),
-            rng: SklearnRng::new(seed),
-            max_features,
+            feature_sampler: FeatureSampler::new(n_features, seed, max_features),
             min_samples_leaf,
             min_weight_leaf,
             sorted: Vec::new(),
@@ -52,29 +48,13 @@ impl SplitFinder for ExactSplitFinder {
         parent: &NodeStats,
         known_constants: &[usize],
     ) -> Result<SplitSearch, String> {
-        let n_known = known_constants.len();
-        self.features[..n_known].copy_from_slice(known_constants);
-        let mut f_i = n_features;
-        let mut n_visited = 0usize;
-        let mut n_found = 0usize;
-        let mut n_drawn_constants = 0usize;
-        let mut n_total_constants = n_known;
+        let mut feature_search = self.feature_sampler.begin(known_constants);
         let mut best: Option<Split> = None;
         let mut best_proxy = f64::NEG_INFINITY;
 
         // Draw candidate features until the sklearn-style stopping rule is met.
-        while f_i > n_total_constants
-            && (n_visited < self.max_features || n_visited <= n_found + n_drawn_constants)
-        {
-            n_visited += 1;
-            let mut f_j = self.rng.bounded(n_drawn_constants, f_i - n_found);
-            if f_j < n_known {
-                self.features.swap(n_drawn_constants, f_j);
-                n_drawn_constants += 1;
-                continue;
-            }
-            f_j += n_found;
-            let feature = self.features[f_j];
+        while let Some(candidate) = self.feature_sampler.next(&mut feature_search) {
+            let feature = candidate.feature;
             self.sorted.clear();
             self.sorted
                 .extend(rows.iter().map(|&row| (x[row * n_features + feature], row)));
@@ -90,17 +70,15 @@ impl SplitFinder for ExactSplitFinder {
             // Constant features are remembered and skipped in future search rounds.
             if finite_end == 0
                 || (finite_end == self.sorted.len()
-                    && self.sorted[finite_end - 1].0
-                        <= self.sorted[0].0 + FEATURE_THRESHOLD)
+                    && self.sorted[finite_end - 1].0 <= self.sorted[0].0 + FEATURE_THRESHOLD)
             {
-                self.features.swap(f_j, n_total_constants);
-                n_found += 1;
-                n_total_constants += 1;
+                self.feature_sampler
+                    .mark_constant(&mut feature_search, candidate);
                 continue;
             }
 
-            f_i -= 1;
-            self.features.swap(f_i, f_j);
+            self.feature_sampler
+                .mark_nonconstant(&mut feature_search, candidate);
             self.left_counts.resize(n_classes, 0.0);
             self.left_counts.fill(0.0);
             self.right_counts.clone_from(&parent.class_weights);
@@ -120,8 +98,7 @@ impl SplitFinder for ExactSplitFinder {
             while p < finite_end {
                 let p_prev = p;
                 p += 1;
-                while p < finite_end
-                    && self.sorted[p].0 <= self.sorted[p - 1].0 + FEATURE_THRESHOLD
+                while p < finite_end && self.sorted[p].0 <= self.sorted[p - 1].0 + FEATURE_THRESHOLD
                 {
                     p += 1;
                 }
@@ -223,9 +200,7 @@ impl SplitFinder for ExactSplitFinder {
                 }
             }
         }
-        let mut constants = known_constants.to_vec();
-        constants.extend_from_slice(&self.features[n_known..n_total_constants]);
-        self.features[..n_known].copy_from_slice(known_constants);
+        let constants = self.feature_sampler.finish(feature_search, known_constants);
         Ok(SplitSearch {
             split: best,
             constants,

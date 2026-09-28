@@ -1,13 +1,14 @@
-"""Standalone Rust adapters for exact tree and serial forest classification.
+"""Standalone Rust adapters for exact tree and bounded forest classification.
 
-Both estimators share the compact native tree model, exact split finder, NaN
-routing, and prediction traversal. Forest bootstrap samples stay in native
-code as multiplicity weights rather than duplicated rows.
+Exact and histogram forests share bootstrap orchestration, tree growth, compact
+models, NaN routing, and prediction. Bootstrap samples stay in native code as
+multiplicity weights rather than duplicated rows.
 """
 
 from __future__ import annotations
 
 import numbers
+import os
 
 import numpy as np
 from scipy import sparse
@@ -22,6 +23,7 @@ from sklearn.utils.validation import (
 )
 
 from .. import _rust_backend as rb
+from .._config import get_config
 
 
 # Keep the supported configuration narrow so the Rust path stays parity-safe.
@@ -177,15 +179,11 @@ class RustDecisionTreeClassifier(DecisionTreeClassifier):
         return rb.tree_model_arrays(self._tree_model_handle_)
 
 
-def supports_rust_random_forest_classifier(estimator) -> tuple[bool, str]:
-    """Return whether an estimator belongs to the standalone serial subset."""
+def _supports_rust_random_forest_parameters(estimator) -> tuple[bool, str]:
     if not isinstance(estimator, RandomForestClassifier):
         return False, "estimator is not a sklearn RandomForestClassifier"
-    if not rb.HAVE_RUST or rb.forest_fit_exact is None:
-        return False, "Rust random-forest runtime is not available"
     checks = (
         (estimator.criterion == "gini", "criterion must be 'gini'"),
-        (estimator.n_jobs in (None, 1), "n_jobs must be None or 1 for the serial forest"),
         (
             estimator.bootstrap or estimator.max_samples is None,
             "max_samples requires bootstrap=True",
@@ -209,14 +207,53 @@ def supports_rust_random_forest_classifier(estimator) -> tuple[bool, str]:
     return True, ""
 
 
+def supports_rust_random_forest_classifier(estimator) -> tuple[bool, str]:
+    """Return whether the standalone exact forest can run this estimator."""
+    supported, reason = _supports_rust_random_forest_parameters(estimator)
+    if not supported:
+        return supported, reason
+    if not rb.HAVE_RUST or rb.forest_fit_exact is None:
+        return False, "Rust exact random-forest runtime is not available"
+    return True, ""
+
+
 class RustRandomForestClassifier(RandomForestClassifier):
-    """Sklearn-style adapter backed by a serial Rust exact random forest."""
+    """Sklearn-style adapter backed by a bounded parallel Rust forest."""
+
+    def _bind_native_worker_budget(self, workers):
+        """Bind a plan-time worker snapshot for a future physical operator."""
+        if not isinstance(workers, numbers.Integral) or workers <= 0:
+            raise ValueError("native worker budget must be a positive integer")
+        self._stratum_worker_budget = int(workers)
+        return self
+
+    def _bind_histogram_backend(self, n_bins=128):
+        """Bind the standalone approximate histogram implementation."""
+        if not isinstance(n_bins, numbers.Integral) or not 2 <= n_bins <= 255:
+            raise ValueError("n_bins must be an integer in 2..=255")
+        if not rb.HAVE_RUST or rb.forest_fit_hist is None:
+            raise ValueError("Rust histogram random-forest runtime is not available")
+        self._stratum_forest_fit = rb.forest_fit_hist
+        self._stratum_forest_fit_args = (int(n_bins),)
+        return self
+
+    def __sklearn_clone__(self):
+        clone = type(self)(**self.get_params(deep=False))
+        if hasattr(self, "_stratum_forest_fit"):
+            clone._stratum_forest_fit = self._stratum_forest_fit
+            clone._stratum_forest_fit_args = self._stratum_forest_fit_args
+        if hasattr(self, "_stratum_worker_budget"):
+            clone._stratum_worker_budget = self._stratum_worker_budget
+        return clone
 
     def fit(self, X, y, sample_weight=None):
         self._validate_params()
-        supported, reason = supports_rust_random_forest_classifier(self)
+        supported, reason = _supports_rust_random_forest_parameters(self)
         if not supported:
             raise ValueError(f"unsupported Rust random-forest configuration: {reason}")
+        native_fit = getattr(self, "_stratum_forest_fit", rb.forest_fit_exact)
+        if native_fit is None:
+            raise ValueError("bound Rust random-forest runtime is not available")
         if sample_weight is not None:
             raise ValueError("sample_weight is not supported by the Rust random forest")
 
@@ -284,9 +321,13 @@ class RustRandomForestClassifier(RandomForestClassifier):
             ),
             dtype=np.int64,
         )
+        configured_workers = getattr(
+            self, "_stratum_worker_budget", get_config()["num_threads"]
+        )
+        self._native_worker_budget_ = int(configured_workers) or (os.cpu_count() or 1)
         X = np.ascontiguousarray(X, dtype=np.float32)
         encoded = np.ascontiguousarray(encoded, dtype=np.int64)
-        self._forest_model_handle_ = rb.forest_fit_exact(
+        self._forest_model_handle_ = native_fit(
             X,
             encoded,
             tree_seeds,
@@ -299,6 +340,8 @@ class RustRandomForestClassifier(RandomForestClassifier):
             self.max_leaf_nodes,
             bool(self.bootstrap),
             n_bootstrap,
+            self._native_worker_budget_,
+            *getattr(self, "_stratum_forest_fit_args", ()),
         )
         return self
 

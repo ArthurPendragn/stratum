@@ -81,5 +81,6 @@ tree_model_from_arrays = getattr(native, "tree_model_from_arrays", None) if nati
 tree_predict = getattr(native, "tree_predict", None) if native else None
 tree_model_arrays = getattr(native, "tree_model_arrays", None) if native else None
 forest_fit_exact = getattr(native, "forest_fit_exact", None) if native else None
+forest_fit_hist = getattr(native, "forest_fit_hist", None) if native else None
 forest_predict = getattr(native, "forest_predict", None) if native else None
 forest_model_info = getattr(native, "forest_model_info", None) if native else None

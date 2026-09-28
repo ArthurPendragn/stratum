@@ -36,6 +36,7 @@ fn _rust_backend_native(_py: Python<'_>, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tree::tree_predict, m)?)?;
     m.add_function(wrap_pyfunction!(tree::tree_model_arrays, m)?)?;
     m.add_function(wrap_pyfunction!(tree::forest_fit_exact, m)?)?;
+    m.add_function(wrap_pyfunction!(tree::forest_fit_hist, m)?)?;
     m.add_function(wrap_pyfunction!(tree::forest_predict, m)?)?;
     m.add_function(wrap_pyfunction!(tree::forest_model_info, m)?)?;
     Ok(())

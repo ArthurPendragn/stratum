@@ -1,8 +1,11 @@
 // Tree construction, split search, model storage, and RNG helpers.
 mod builder;
 mod exact;
+mod feature_sampling;
 mod forest;
+mod histogram;
 mod model;
+mod quantization;
 mod rng;
 
 use std::sync::Arc;
@@ -14,7 +17,9 @@ use pyo3::prelude::*;
 use builder::{build_tree, BuildParams};
 use exact::ExactSplitFinder;
 
-pub(crate) use forest::{forest_fit_exact, forest_model_info, forest_predict, ForestModelHandle};
+pub(crate) use forest::{
+    forest_fit_exact, forest_fit_hist, forest_model_info, forest_predict, ForestModelHandle,
+};
 pub(crate) use model::{tree_model_arrays, tree_model_from_arrays, tree_predict, TreeModelHandle};
 
 // Fit the exact finite-value decision tree from dense float32 features.

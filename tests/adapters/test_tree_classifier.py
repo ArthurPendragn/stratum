@@ -6,10 +6,12 @@ import pandas as pd
 import polars as pl
 import pytest
 import sklearn
+from sklearn.base import clone
 from sklearn.datasets import make_classification
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.tree import DecisionTreeClassifier
 
+from stratum import config
 from stratum import _rust_backend as rb
 from stratum.adapters.tree_classifier import (
     RustDecisionTreeClassifier,
@@ -17,6 +19,7 @@ from stratum.adapters.tree_classifier import (
     supports_rust_random_forest_classifier,
     supports_rust_tree_classifier,
 )
+from stratum.optimizer.physical import PlanContext
 
 
 pytestmark = pytest.mark.skipif(
@@ -38,9 +41,7 @@ TREE_CLASSIFIER_CONTRACT = {
         "class_weight": False,
         "missing_values": True,
     },
-    "deferred_tasks": {
-        "forest_parallelism": 9,
-    },
+    "parallel_forest": True,
 }
 
 
@@ -48,7 +49,7 @@ TREE_CLASSIFIER_CONTRACT = {
 def test_semantics_contract_pins_sklearn_version_and_exact_scope():
     assert sklearn.__version__ == TREE_CLASSIFIER_CONTRACT["sklearn_version"]
     assert TREE_CLASSIFIER_CONTRACT["supported"]["missing_values"] is True
-    assert TREE_CLASSIFIER_CONTRACT["deferred_tasks"]["forest_parallelism"] == 9
+    assert TREE_CLASSIFIER_CONTRACT["parallel_forest"] is True
 
 
 # Validate direct native handles, prediction output, and reference lifetime.
@@ -304,11 +305,6 @@ def test_forest_bootstrap_uses_multiplicity_weights_not_duplicate_rows():
 
 def test_serial_forest_validation_and_global_class_columns():
     supported, reason = supports_rust_random_forest_classifier(
-        RandomForestClassifier(n_jobs=2)
-    )
-    assert not supported
-    assert "n_jobs" in reason
-    supported, reason = supports_rust_random_forest_classifier(
         RandomForestClassifier(bootstrap=False, max_samples=0.5)
     )
     assert not supported
@@ -324,3 +320,177 @@ def test_serial_forest_validation_and_global_class_columns():
         n_estimators=7, max_samples=2, random_state=3, n_jobs=1
     ).fit(X, y)
     assert model.predict_proba(X).shape == (len(X), 3)
+
+
+def test_parallel_forest_is_deterministic_and_preserves_tree_order():
+    X, y = make_classification(
+        n_samples=1_200,
+        n_features=12,
+        n_informative=8,
+        n_redundant=0,
+        n_classes=3,
+        random_state=23,
+    )
+    models = []
+    for workers in (1, 2, 4):
+        with config(num_threads=workers):
+            model = RustRandomForestClassifier(
+                n_estimators=17,
+                max_depth=8,
+                random_state=11,
+                n_jobs=8,
+            ).fit(X, y)
+        assert model._native_worker_budget_ == workers
+        assert model._inspect_model()["worker_budget"] == workers
+        models.append(model)
+
+    reference_info = models[0]._inspect_model()
+    reference_probabilities = models[0].predict_proba(X)
+    for model in models[1:]:
+        info = model._inspect_model()
+        np.testing.assert_array_equal(info["tree_seeds"], reference_info["tree_seeds"])
+        np.testing.assert_array_equal(
+            info["root_n_node_samples"], reference_info["root_n_node_samples"]
+        )
+        np.testing.assert_array_equal(model.predict_proba(X), reference_probabilities)
+        np.testing.assert_array_equal(model.predict(X), models[0].predict(X))
+
+
+def test_worker_budget_snapshot_is_not_frozen_by_first_native_use():
+    X, y = make_classification(
+        n_samples=200,
+        n_features=6,
+        n_informative=4,
+        n_redundant=0,
+        random_state=2,
+    )
+    with config(num_threads=1):
+        first_context = PlanContext.from_flags()
+        first = RustRandomForestClassifier(n_estimators=3, random_state=0).fit(X, y)
+    with config(num_threads=3):
+        second_context = PlanContext.from_flags()
+        second = RustRandomForestClassifier(n_estimators=3, random_state=0).fit(X, y)
+
+    assert first_context.parallelism == first._inspect_model()["worker_budget"] == 1
+    assert second_context.parallelism == second._inspect_model()["worker_budget"] == 3
+    np.testing.assert_array_equal(first.predict_proba(X), second.predict_proba(X))
+
+
+def test_histogram_forest_matches_exact_when_all_distinct_partitions_fit():
+    X = np.array(
+        [[0, 0], [0, 1], [1, 0], [1, 1], [2, 0], [2, 1]], dtype=np.float32
+    )
+    y = np.array([0, 0, 0, 1, 1, 1])
+    params = dict(
+        n_estimators=5,
+        bootstrap=False,
+        max_features=None,
+        random_state=4,
+    )
+    exact = RustRandomForestClassifier(**params).fit(X, y)
+    hist = RustRandomForestClassifier(**params)._bind_histogram_backend(64).fit(X, y)
+
+    np.testing.assert_array_equal(hist.predict(X), exact.predict(X))
+    np.testing.assert_allclose(hist.predict_proba(X), exact.predict_proba(X))
+    assert type(hist._forest_model_handle_) is type(exact._forest_model_handle_)
+    info = hist._inspect_model()
+    assert info["split_backend"] == "histogram"
+    assert info["quantization_count"] == 1
+    assert info["binned_matrix_bytes"] == X.size
+    assert info["actual_bins_max"] == 3
+
+
+def test_histogram_forest_quality_missing_values_and_shared_builder_constraints():
+    X, y = make_classification(
+        n_samples=800,
+        n_features=12,
+        n_informative=8,
+        n_redundant=0,
+        n_classes=3,
+        random_state=31,
+    )
+    X[np.random.RandomState(8).rand(*X.shape) < 0.03] = np.nan
+    params = dict(
+        n_estimators=19,
+        max_depth=8,
+        max_leaf_nodes=24,
+        min_samples_leaf=2,
+        random_state=9,
+    )
+    reference = RandomForestClassifier(**params).fit(X, y)
+    hist = RustRandomForestClassifier(**params)._bind_histogram_backend().fit(X, y)
+
+    assert np.mean(hist.predict(X) == reference.predict(X)) >= 0.90
+    assert abs(hist.score(X, y) - reference.score(X, y)) <= 0.05
+    assert np.isfinite(hist.predict_proba(X)).all()
+    info = hist._inspect_model()
+    assert info["n_leaves"] <= params["n_estimators"] * params["max_leaf_nodes"]
+    assert info["max_depth"] <= params["max_depth"]
+    assert info["scratch_bytes"] > 0
+
+
+def test_histogram_forest_is_deterministic_across_worker_budgets():
+    X, y = make_classification(
+        n_samples=600,
+        n_features=10,
+        n_informative=7,
+        n_redundant=0,
+        n_classes=3,
+        random_state=5,
+    )
+    models = []
+    for workers in (1, 3):
+        with config(num_threads=workers):
+            models.append(
+                RustRandomForestClassifier(
+                    n_estimators=13, max_depth=7, random_state=12
+                )
+                ._bind_histogram_backend(128)
+                .fit(X, y)
+            )
+
+    np.testing.assert_array_equal(models[0].predict_proba(X), models[1].predict_proba(X))
+    assert models[0]._inspect_model()["scratch_bytes"] * 3 == models[1]._inspect_model()[
+        "scratch_bytes"
+    ]
+
+
+@pytest.mark.parametrize("n_bins", [1, 256, 12.5])
+def test_histogram_forest_rejects_invalid_bin_counts(n_bins):
+    with pytest.raises(ValueError, match="n_bins"):
+        RustRandomForestClassifier()._bind_histogram_backend(n_bins)
+
+
+def test_histogram_binding_survives_sklearn_clone():
+    estimator = (
+        RustRandomForestClassifier(n_estimators=3, random_state=0)
+        ._bind_native_worker_budget(2)
+        ._bind_histogram_backend(64)
+    )
+    cloned = clone(estimator)
+    cloned.fit([[0.0], [1.0], [2.0], [3.0]], [0, 0, 1, 1])
+
+    info = cloned._inspect_model()
+    assert info["split_backend"] == "histogram"
+    assert info["requested_bins"] == 64
+    assert info["worker_budget"] == 2
+
+
+def test_native_histogram_fit_rejects_empty_training_input():
+    with pytest.raises(ValueError, match="non-empty"):
+        rb.forest_fit_hist(
+            np.empty((0, 1), dtype=np.float32),
+            np.empty(0, dtype=np.int64),
+            np.array([0], dtype=np.int64),
+            2,
+            3,
+            2,
+            1,
+            1,
+            0.0,
+            None,
+            True,
+            1,
+            1,
+            128,
+        )
