@@ -674,13 +674,14 @@ class TestValueCountsPipeline(unittest.TestCase):
         pd.testing.assert_series_equal(self._run_plan(ops),
                                        self.df["t"].value_counts(sort=False))
 
-    def _plan(self):
+    def _plan(self, **config):
         def build(frame):
             target = frame["t"]
             counts = target.value_counts()
             eligible = counts[counts >= 3].index
             return frame[target.isin(eligible)].reset_index(drop=True)
-        return (optimize(build(st.as_data_op(self.df)), OptConfig(dataframe_ops=True)),
+        return (optimize(build(st.as_data_op(self.df)),
+                         OptConfig(dataframe_ops=True, **config)),
                 build(self.df))
 
     def test_the_driving_pipeline_extracts_and_matches_pandas(self):
@@ -694,20 +695,22 @@ class TestValueCountsPipeline(unittest.TestCase):
         self.assertEqual(1, sum(issubclass(k, SortOp) for k in kinds))
         self.assertEqual(1, sum(issubclass(k, GetAttrProjectionOp) for k in kinds))
         self.assertEqual(1, sum(issubclass(k, MetadataOp) for k in kinds))
-        # The counts filter is a mask over a *series*, which used to be refused.
-        # The other mask is the frame filter, whose `isin` predicate is a column
-        # method (#213) until #196 promotes it to a semi-join.
-        masks = [o for o in ops if isinstance(o, SelectionOp)
+        # Two mask selections before the semi-join promotion runs: one over the
+        # counts, a mask on a *series*, which used to be refused, and one over
+        # the rows of the frame.
+        unpromoted, _ = self._plan(semi_join_rewrite=False)
+        masks = [o for o in unpromoted if isinstance(o, SelectionOp)
                  and o.kind is SelectionKind.MASK]
-        self.assertEqual([OutputType.FRAME, OutputType.SERIES],
-                         sorted((m.output_type for m in masks), key=lambda t: t.name))
+        self.assertEqual(2, len(masks))
+        self.assertEqual({OutputType.SERIES, OutputType.FRAME},
+                         {m.output_type for m in masks})
+        # The frame one is what the promotion consumes, leaving the series one.
+        self.assertEqual(1, sum(isinstance(o, SelectionOp) for o in ops))
 
-    def test_no_raw_method_call_is_left(self):
-        # `isin` is extracted as a column method (#213), so every call in the
-        # pipeline is now a frame operator.
+    def test_no_raw_method_calls_survive(self):
         ops, _ = self._plan()
-        leftover = [o.method_name for o in ops if type(o) is MethodCallOp]
-        self.assertEqual([], leftover)
+        self.assertEqual([], [o.method_name for o in ops
+                              if type(o) is MethodCallOp])
 
 
 if __name__ == "__main__":

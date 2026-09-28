@@ -13,7 +13,8 @@ from stratum.optimizer._optimize import OptConfig
 from stratum.optimizer.logical._dataframe_ops import (
     ColumnProjectionOp, SelectionKind, SelectionOp)
 from stratum.optimizer.logical._ops import BinOp, GetItemOp, UnaryOp, Op, OperandRef, OutputType
-from stratum.optimizer.logical._column_expr import Col, Const, BinOpExpr, UnaryOpExpr, OperandLeaf, StrExpr
+from stratum.optimizer.logical._column_expr import (
+    Col, ColumnMethodExpr, Const, BinOpExpr, UnaryOpExpr, OperandLeaf, StrExpr)
 from stratum.optimizer.physical._source_execs import rechunk_pl_frame
 from .test_dataframe_ops import (
     optimize, run_op, force_polars)
@@ -349,6 +350,34 @@ class TestSeriesMaskFolding(unittest.TestCase):
         self.assertTrue(_query_selectable(sel))
         sel.output_type = OutputType.SERIES
         self.assertFalse(_query_selectable(sel))
+
+
+class TestIsInPredicate(unittest.TestCase):
+    """`isin` folds into a selection as the column-method node (#213) for both a
+    literal collection and a graph-fed relation; only the latter is promoted."""
+
+    def setUp(self):
+        self.pdf = pd.DataFrame({"c": ["a", "b", "c", "a"]})
+
+    def _predicate(self, build):
+        ops = optimize(build(), OptConfig(dataframe_ops=True, semi_join_rewrite=False))
+        return next(o for o in ops if isinstance(o, SelectionOp)).predicate
+
+    def test_a_literal_collection_folds_into_the_predicate(self):
+        data = st.as_data_op(self.pdf)
+        predicate = self._predicate(lambda: data[data["c"].isin(["a", "c"])])
+        self.assertEqual(ColumnMethodExpr(Col("c"), "isin", (["a", "c"],)), predicate)
+
+    def test_a_relation_stays_a_leaf(self):
+        data = st.as_data_op(self.pdf)
+        other = st.as_data_op(pd.DataFrame({"c": ["a"]}))
+        predicate = self._predicate(lambda: data[data["c"].isin(other["c"])])
+        self.assertEqual(
+            ColumnMethodExpr(Col("c"), "isin", (OperandLeaf(OperandRef(1)),)), predicate)
+
+    def test_a_membership_test_is_not_an_aggregate(self):
+        self.assertFalse(
+            ColumnMethodExpr(Col("c"), "isin", (("a", "c"),)).has_aggregate())
 
 
 class TestColumnExprOperandRefs(unittest.TestCase):

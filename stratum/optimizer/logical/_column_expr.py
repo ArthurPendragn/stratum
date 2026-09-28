@@ -288,6 +288,7 @@ class UnaryOpExpr(ColumnExpr):
         return self.operand.has_aggregate()
 
 
+
 class StrExpr(ColumnExpr):
     """String accessor call (``.str.<method>()``)."""
     __slots__ = ("operand", "method", "args", "kwargs")
