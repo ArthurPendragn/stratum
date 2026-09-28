@@ -233,6 +233,14 @@ class TestAggregateHelpers(unittest.TestCase):
         self.assertTrue(_is_aggregation(agg))
         self.assertEqual("sum", _extract_aggregations(agg))
 
+    def test_named_aggregation_requires_column_reduction_pairs(self):
+        _, named = _groupby_agg_pair(
+            agg_method="agg", agg_kwargs={"total": ("v", "sum")})
+        self.assertTrue(_is_aggregation(named))
+        _, multi_output = _groupby_agg_pair(
+            agg_method="agg", agg_kwargs={"total": ["sum", "mean"]})
+        self.assertFalse(_is_aggregation(multi_output))
+
     def test_is_aggregation_agg_without_spec_is_false(self):
         _, agg = _groupby_agg_pair(agg_method="agg", agg_args=())
         self.assertFalse(_is_aggregation(agg))
@@ -374,6 +382,19 @@ class TestAggregateRewrites(unittest.TestCase):
                          kwarg[0].structure_key()[2])
         pd.testing.assert_frame_equal(
             self._run_plan(ops), self.df.groupby("g").agg(func="sum"))
+
+    def test_named_aggregation_fuses_and_preserves_output_names(self):
+        data = st.as_data_op(self.df).groupby("g").agg(
+            total=("v", "sum"), minimum=("v", "min"))
+        ops, agg_ops = self._agg_ops(data)
+        self.assertEqual(1, len(agg_ops))
+        self.assertEqual(
+            (("total", AggExpr("sum", Col("v"))),
+             ("minimum", AggExpr("min", Col("v")))),
+            agg_ops[0].aggregations)
+        pd.testing.assert_frame_equal(
+            self._run_plan(ops),
+            self.df.groupby("g").agg(total=("v", "sum"), minimum=("v", "min")))
 
     def test_direct_method_fuses_and_executes(self):
         data = st.as_data_op(self.df).groupby("g").mean(numeric_only=True)

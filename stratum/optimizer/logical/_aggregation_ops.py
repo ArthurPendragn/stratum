@@ -221,7 +221,33 @@ def _is_aggregation(op: MethodCallOp) -> bool:
     # `.agg(spec)` / `.aggregate(spec)`, positionally or as `func=`; a call with
     # no spec at all is not an aggregation.
     return (op.method_name in _AGG_FUNCS
-            and _extract_aggregations(op) is not None)
+            and (_extract_aggregations(op) is not None
+                 or _named_aggregation_entries(op) is not None))
+
+
+def _named_aggregation_entries(op: MethodCallOp) -> tuple | None:
+    """Recognise pandas ``agg(name=(column, reduction), ...)`` syntax.
+
+    A positional dict whose values are tuples has different pandas semantics,
+    so this path is deliberately limited to keyword named aggregation.
+    """
+    if op.method_name not in _AGG_FUNCS or op.args or "func" in (op.kwargs or {}):
+        return None
+    named = {k: v for k, v in (op.kwargs or {}).items()
+             if k not in _EXECUTION_HINTS}
+    if not named:
+        return None
+    entries = []
+    try:
+        for name, value in named.items():
+            if (not isinstance(name, str) or not isinstance(value, tuple)
+                    or len(value) != 2 or not all(isinstance(v, str) for v in value)):
+                return None
+            column, reduction = value
+            entries.append((name, AggExpr(reduction, Col(column))))
+    except NotImplementedError:
+        return None
+    return tuple(entries)
 
 
 def _extract_grouping(groupby_op: MethodCallOp) -> str | list[str] | OperandRef:
@@ -367,13 +393,19 @@ def make_aggregate_op(op: MethodCallOp) -> AggregateOp | None:
     groupby_op, selection = source
     df = groupby_op.inputs[0]
 
-    params = _aggregation_params(op)
-    if params is None:
-        return None
     columns = _selected_columns(selection)
     if selection is not None and columns is None:
         return None
-    entries = _aggregation_entries(_extract_aggregations(op), params, columns)
+    named_entries = _named_aggregation_entries(op)
+    if named_entries is not None and selection is not None:
+        return None
+    if named_entries is not None:
+        entries = named_entries
+    else:
+        params = _aggregation_params(op)
+        if params is None:
+            return None
+        entries = _aggregation_entries(_extract_aggregations(op), params, columns)
     if entries is None:
         return None
 
