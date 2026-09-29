@@ -208,12 +208,22 @@ def _supports_rust_random_forest_parameters(estimator) -> tuple[bool, str]:
 
 
 def supports_rust_random_forest_classifier(estimator) -> tuple[bool, str]:
-    """Return whether the standalone exact forest can run this estimator."""
+    """Return whether the exact forest can run this estimator."""
     supported, reason = _supports_rust_random_forest_parameters(estimator)
     if not supported:
         return supported, reason
     if not rb.HAVE_RUST or rb.forest_fit_exact is None:
         return False, "Rust exact random-forest runtime is not available"
+    return True, ""
+
+
+def supports_rust_histogram_random_forest_classifier(estimator) -> tuple[bool, str]:
+    """Return whether the histogram forest can run this estimator."""
+    supported, reason = _supports_rust_random_forest_parameters(estimator)
+    if not supported:
+        return supported, reason
+    if not rb.HAVE_RUST or rb.forest_fit_hist is None:
+        return False, "Rust histogram random-forest runtime is not available"
     return True, ""
 
 
@@ -227,21 +237,41 @@ class RustRandomForestClassifier(RandomForestClassifier):
         self._stratum_worker_budget = int(workers)
         return self
 
+    def _bind_forest_backend(self, backend, native_fit, native_fit_args=()):
+        """Bind one native split backend before execution.
+
+        Physical selection calls this once. Refusing a different second binding
+        keeps the selected algorithm immutable for the estimator's lifetime.
+        """
+        binding = (backend, native_fit, tuple(native_fit_args))
+        current = getattr(self, "_stratum_forest_binding", None)
+        if current is not None and current != binding:
+            raise ValueError("Rust random-forest split backend is already bound")
+        self._stratum_forest_binding = binding
+        self._stratum_forest_fit = native_fit
+        self._stratum_forest_fit_args = tuple(native_fit_args)
+        return self
+
+    def _bind_exact_backend(self):
+        """Bind the exact native split finder for physical execution."""
+        if not rb.HAVE_RUST or rb.forest_fit_exact is None:
+            raise ValueError("Rust exact random-forest runtime is not available")
+        return self._bind_forest_backend("exact", rb.forest_fit_exact)
+
     def _bind_histogram_backend(self, n_bins=128):
         """Bind the standalone approximate histogram implementation."""
         if not isinstance(n_bins, numbers.Integral) or not 2 <= n_bins <= 255:
             raise ValueError("n_bins must be an integer in 2..=255")
         if not rb.HAVE_RUST or rb.forest_fit_hist is None:
             raise ValueError("Rust histogram random-forest runtime is not available")
-        self._stratum_forest_fit = rb.forest_fit_hist
-        self._stratum_forest_fit_args = (int(n_bins),)
-        return self
+        return self._bind_forest_backend(
+            "histogram", rb.forest_fit_hist, (int(n_bins),)
+        )
 
     def __sklearn_clone__(self):
         clone = type(self)(**self.get_params(deep=False))
         if hasattr(self, "_stratum_forest_fit"):
-            clone._stratum_forest_fit = self._stratum_forest_fit
-            clone._stratum_forest_fit_args = self._stratum_forest_fit_args
+            clone._bind_forest_backend(*self._stratum_forest_binding)
         if hasattr(self, "_stratum_worker_budget"):
             clone._stratum_worker_budget = self._stratum_worker_budget
         return clone

@@ -476,6 +476,47 @@ def test_histogram_binding_survives_sklearn_clone():
     assert info["worker_budget"] == 2
 
 
+@pytest.mark.parametrize(
+    "backend, expected_bins",
+    [("exact", None), ("histogram", 128)],
+)
+def test_bound_forest_backend_invokes_selected_native_entry_point(
+    monkeypatch, backend, expected_bins
+):
+    calls = []
+
+    def native_fit(*args):
+        calls.append(args)
+        return object()
+
+    if backend == "exact":
+        monkeypatch.setattr(rb, "forest_fit_exact", native_fit)
+        model = RustRandomForestClassifier(n_estimators=2, random_state=0)
+        model._bind_exact_backend()
+    else:
+        monkeypatch.setattr(rb, "forest_fit_hist", native_fit)
+        model = RustRandomForestClassifier(n_estimators=2, random_state=0)
+        model._bind_histogram_backend(expected_bins)
+
+    model._bind_native_worker_budget(3).fit(
+        [[0.0], [1.0], [2.0], [3.0]], [0, 0, 1, 1]
+    )
+
+    assert len(calls) == 1
+    assert calls[0][12] == 3
+    if expected_bins is None:
+        assert len(calls[0]) == 13
+    else:
+        assert calls[0][13] == expected_bins
+
+
+def test_forest_backend_binding_is_immutable():
+    model = RustRandomForestClassifier()._bind_exact_backend()
+
+    with pytest.raises(ValueError, match="already bound"):
+        model._bind_histogram_backend()
+
+
 def test_native_histogram_fit_rejects_empty_training_input():
     with pytest.raises(ValueError, match="non-empty"):
         rb.forest_fit_hist(
