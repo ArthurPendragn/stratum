@@ -576,11 +576,16 @@ class TestColumnExprQueryStrings(unittest.TestCase):
 class TestColumnExprMisc(unittest.TestCase):
     """Assorted ColumnExpr node behaviour."""
 
+    def test_const_key_distinguishes_scalar_types(self):
+        self.assertNotEqual(Const(1), Const(1.0))
+        self.assertNotEqual(Const(1), Const(True))
+        self.assertNotEqual(Const(1.0), Const(True))
+
     def test_const_unhashable_value_key(self):
         # An unhashable literal falls back to an identity-based key.
         value = [1, 2]
         c = Const(value)
-        self.assertEqual(("__id__", id(value)), c._key())
+        self.assertEqual((list, "__id__", id(value)), c._key())
         self.assertEqual(c, Const(value))  # same object -> equal
         hash(c)  # does not raise
 

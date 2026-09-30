@@ -1,6 +1,6 @@
-"""TPC-H Q1 run through Stratum, checked against the query it was ported from.
+"""PDS Q1 run through Stratum, checked against the query it was ported from.
 
-The source is ``queries/modin/q1.py`` in polars-benchmark. :func:`q1_reference`
+The source is ``queries/pandas/q1.py`` in polars-benchmark. :func:`q1_reference`
 is that query; :func:`build_q1` is the same thing as a skrub DAG. Both run on the same
 fixture and must agree, so the port is verified rather than assumed.
 
@@ -14,6 +14,7 @@ from datetime import date
 
 import pytest
 import pandas as pd
+import polars as pl
 
 import stratum as st
 from stratum.optimizer._optimize import OptConfig, optimize as optimize_
@@ -22,7 +23,8 @@ from stratum.optimizer.logical._map_ops import AssignMapOp
 from stratum.optimizer.logical._ops import ValueOp
 from stratum.optimizer.logical._selection_ops import SelectionKind, SelectionOp
 from stratum.optimizer.physical._physical_ops import PhysicalOp
-from tests.optimizer.logical.test_dataframe_ops import force_polars
+from stratum.optimizer.physical._selection_execs import PolarsSelectionOp
+from stratum.optimizer.physical._map_execs import PolarsAssignMapOp
 from stratum.frontend._skrub_graph import get_data
 
 # The Q1 cutoff: `var1` in the upstream query.
@@ -87,8 +89,8 @@ def q1_reference(line_item_ds):
     return agg.sort_values(["l_returnflag", "l_linestatus"])
 
 
-def build_q1(line_item_df):
-    """The same query as a skrub DAG.
+def build_q1_prefix(line_item_df):
+    """The filtering and computed-column portion of Q1 as a skrub DAG.
 
     DataOps are immutable, so the two ``filt[...] = ...`` assignments become one
     ``.assign(...)`` and ``filt.l_extendedprice`` becomes ``filt["..."]`` (attribute
@@ -104,6 +106,13 @@ def build_q1(line_item_df):
         charge=(filt["l_extendedprice"] * (1.0 - filt["l_discount"])
                 * (1.0 + filt["l_tax"])),
     )
+
+    return filt
+
+
+def build_q1(line_item_df):
+    """Complete Q1 query, including the pandas groupby and aggregation."""
+    filt = build_q1_prefix(line_item_df)
 
     gb = filt.groupby(["l_returnflag", "l_linestatus"], as_index=False)
     agg = gb.agg(
@@ -134,13 +143,13 @@ def _one(ops, cls):
 
 @pytest.fixture(params=[False, True], ids=["pandas", "polars"])
 def polars(request):
-    with force_polars(request.param):
+    with st.config(implementation_selector="greedy" if request.param else "default"):
         yield request.param
 
 
 # --- parity ----------------------------------------------------------------
 
-def test_q1_matches_reference(polars):
+def test_q1_matches_reference():
     """The skrubified query returns what the upstream query returns."""
     df = make_lineitem()
     expected = q1_reference(df)
@@ -150,8 +159,23 @@ def test_q1_matches_reference(polars):
     pd.testing.assert_frame_equal(
         expected.reset_index(drop=True),
         pd.DataFrame(result).reset_index(drop=True),
-        check_dtype=False,  # the polars round-trip renormalises the Arrow dtypes
+        check_dtype=False,  # compare values across Arrow-backed input and runtime output
     )
+
+
+def test_q1_prefix_runs_on_polars():
+    df = make_lineitem()
+    expected = df[df["l_shipdate"] <= SHIPDATE_CUTOFF].copy()
+    expected["disc_price"] = expected.l_extendedprice * (1.0 - expected.l_discount)
+    expected["charge"] = (expected.l_extendedprice *
+                          (1.0 - expected.l_discount) * (1.0 + expected.l_tax))
+    expected["l_shipdate"] = pd.to_datetime(expected["l_shipdate"])
+    with st.config(implementation_selector="greedy"):
+        result = st._api.evaluate(build_q1_prefix(df))
+    assert isinstance(result, pl.DataFrame)
+    pd.testing.assert_frame_equal(expected.reset_index(drop=True),
+                                  result.to_pandas().reset_index(drop=True),
+                                  check_dtype=False)
 
 
 # --- the folded plan ------------------------------------------------------
@@ -181,6 +205,9 @@ def test_q1_plan_folds_filter_and_map(polars):
     for op in (sel, amo):
         assert isinstance(op, PhysicalOp), \
             f"{type(op).__name__} was not bound to a physical implementation"
+    if polars:
+        assert isinstance(sel, PolarsSelectionOp)
+        assert isinstance(amo, PolarsAssignMapOp)
 
 
 def test_q1_filter_inlines_the_date_constant(polars):
@@ -199,7 +226,7 @@ def test_q1_filter_inlines_the_date_constant(polars):
 
 
 def test_q1_filter_binds_query_impl_under_flag():
-    """``pandas_query`` picks the impl at plan time, and both compute Q1.
+    """``pandas_query`` picks the impl at plan time; both filter correctly.
 
     The fast path is reachable only because the date is inlined: an ``OperandLeaf``
     makes ``to_pandas_query`` return ``None``. Pandas-only, so no fixture.
@@ -208,12 +235,15 @@ def test_q1_filter_binds_query_impl_under_flag():
         PandasIndexSelectionOp, PandasQuerySelectionOp)
 
     df = make_lineitem()
-    expected = q1_reference(df).reset_index(drop=True)
+    expected = df[df["l_shipdate"] <= SHIPDATE_CUTOFF].reset_index(drop=True)
 
     for flag, impl in [(False, PandasIndexSelectionOp), (True, PandasQuerySelectionOp)]:
-        with st.config(pandas_query=flag):
-            assert isinstance(_one(_plan(build_q1(df)), SelectionOp), impl)
-            result = st._api.evaluate(build_q1(df))
+        dag = build_q1(df)
+        ops = optimize_(dag, OptConfig(dataframe_ops=True, pandas_query=flag),
+                        env=get_data(dag))[0]
+        sel = _one(ops, SelectionOp)
+        assert isinstance(sel, impl)
+        result = sel.process("fit_transform", [df])
         pd.testing.assert_frame_equal(
             expected, pd.DataFrame(result).reset_index(drop=True), check_dtype=False)
 

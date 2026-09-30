@@ -44,8 +44,8 @@ UNARY_SYMBOLS = {operator.invert: "~", operator.neg: "-", operator.pos: "+"}
 # Values a ``ValueOp`` may carry into a ``Const``. Const compiles to ``pl.lit()``,
 # which is only correct for a scalar: a list becomes one list-valued cell repeated
 # per row and a pandas Series is rejected outright. Container values therefore stay
-# ``OperandLeaf``s, so the impls' own conversions still see them (see
-# PolarsAssignMapOp.process). pandas Timestamp/Timedelta subclass the datetime types.
+# ``OperandLeaf``s, where Polars column inputs are converted before expression
+# evaluation. pandas Timestamp/Timedelta subclass the datetime types.
 CONST_SCALAR_TYPES = (
     bool, int, float, str,
     datetime.date, datetime.time, datetime.timedelta,
@@ -174,8 +174,8 @@ class Const(ColumnExpr):
         try:
             hash(self.value)
         except TypeError:
-            return ("__id__", id(self.value))
-        return self.value
+            return (type(self.value), "__id__", id(self.value))
+        return (type(self.value), self.value)
 
     def __repr__(self):
         return f"Const({self.value!r})"
@@ -211,7 +211,12 @@ class OperandLeaf(ColumnExpr):
         return ctx.inputs[self.ref.k]
 
     def to_polars(self, ctx):
-        return ctx.inputs[self.ref.k]
+        value = ctx.inputs[self.ref.k]
+        if isinstance(value, pd.Series):
+            return pl.from_pandas(value)
+        if isinstance(value, list):
+            return pl.Series(value)
+        return value
 
     def iter_operand_refs(self):
         yield self.ref

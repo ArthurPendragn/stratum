@@ -416,13 +416,22 @@ class TestAggregateRewrites(unittest.TestCase):
         self.assertEqual(1, len(agg_ops))
         self.assertEqual((Col("g"),), agg_ops[0].grouping)
 
-    def test_variable_grouping_key_uses_a_placeholder_leaf(self):
+    def test_variable_grouping_key_selects_column(self):
         data = st.as_data_op(self.df).groupby(st.var("key")).agg("sum")
         ops, agg_ops = self._agg_ops(data, env={"key": "g"})
         self.assertEqual(1, len(agg_ops))
-        self.assertEqual((OperandLeaf(OperandRef(1)),), agg_ops[0].grouping)
+        self.assertEqual((Col("g"),), agg_ops[0].grouping)
         pd.testing.assert_frame_equal(self._run_plan(ops),
                                       self.df.groupby("g").agg("sum"))
+
+    def test_variable_grouping_key_selects_column_on_polars(self):
+        with force_polars():
+            data = st.as_data_op(self.df).groupby(st.var("key")).agg({"v": "sum"})
+            ops, agg_ops = self._agg_ops(data, env={"key": "g"})
+            self.assertEqual((Col("g"),), agg_ops[0].grouping)
+            result = self._run_plan(ops)
+            self.assertEqual([{"g": "a", "v": 3}, {"g": "b", "v": 3}],
+                             result.to_dicts())
 
     def test_variable_aggregation_spec_does_not_fuse(self):
         # A graph-fed spec has no canonical reduction name at plan time, so there
