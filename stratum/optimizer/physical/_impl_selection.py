@@ -234,6 +234,9 @@ def bind_op(op: IRNode, ctx: PlanContext,
     logger.debug(f"Selected {impl.backend_name} implementation for {op}")
     if impl.impl_class is not None and impl.impl_class is not type(op):
         op.__class__ = impl.impl_class # late-binding
+    # Downstream format-sensitive operators can inspect the already-bound
+    # producer while this topological pass selects their own implementation.
+    op._selected_backend = impl.backend_name
     if isinstance(op, PhysicalOp):
         op.on_impl_selected(ctx)
     return op

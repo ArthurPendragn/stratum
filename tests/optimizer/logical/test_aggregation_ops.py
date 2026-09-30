@@ -4,7 +4,7 @@ import unittest
 import pandas as pd
 import polars as pl
 import stratum as st
-from stratum.optimizer._optimize import OptConfig
+from stratum.optimizer._optimize import OptConfig, optimize as optimize_
 from stratum.optimizer.logical._aggregation_ops import (
     AggregateOp, _aggregation_entries, _aggregation_params,
     _extract_aggregations, _extract_grouping, _is_aggregation, _is_groupby_op,
@@ -717,6 +717,27 @@ class TestValueCountsPipeline(unittest.TestCase):
     def test_the_driving_pipeline_extracts_and_matches_pandas(self):
         ops, expected = self._plan()
         pd.testing.assert_frame_equal(self._run_plan(ops), expected)
+
+    def test_the_driving_pipeline_runs_with_polars(self):
+        source = st.as_data_op(self.df)
+        target = source["t"]
+        counts = target.value_counts()
+        eligible = counts[counts >= 3].index
+        filtered = source[target.isin(eligible)].reset_index(drop=True)
+        expected = self.df[self.df["t"].isin(
+            self.df["t"].value_counts().loc[lambda values: values >= 3].index
+        )].reset_index(drop=True)
+        with st.config(implementation_selector="greedy"):
+            ops, *_ = optimize_(filtered, OptConfig(dataframe_ops=True))
+            actual = self._run_plan(ops)
+        from stratum.optimizer.physical._aggregation_execs import PandasAggregateOp
+        from stratum.optimizer.physical._selection_execs import PandasIndexSelectionOp
+        from stratum.optimizer.physical._sort_execs import PandasSortOp
+        self.assertTrue(any(isinstance(op, PandasAggregateOp) for op in ops))
+        self.assertTrue(any(isinstance(op, PandasSortOp) for op in ops))
+        self.assertTrue(any(isinstance(op, PandasIndexSelectionOp) for op in ops))
+        self.assertIsInstance(actual, pl.DataFrame)
+        pd.testing.assert_frame_equal(actual.to_pandas(), expected)
 
     def test_every_gap_in_the_pipeline_is_extracted(self):
         ops, _ = self._plan()
