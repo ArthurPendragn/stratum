@@ -8,7 +8,14 @@ from sklearn.model_selection import StratifiedKFold, cross_val_score
 
 import stratum as st
 from stratum.optimizer._optimize import OptConfig, optimize
+from stratum.optimizer.physical._predictor_execs import SklearnRandomForest
 from stratum.optimizer.physical._source_execs import PolarsReadCSV
+
+
+# Keep this preprocessing test on the same sklearn model under both selectors.
+# The Rust forest currently supports only the gini criterion.
+FOREST_PARAMS = dict(n_estimators=8, max_depth=5, criterion="entropy",
+                     random_state=42, n_jobs=1)
 
 
 def make_cover_data() -> pd.DataFrame:
@@ -43,8 +50,7 @@ def build_pipeline(path):
         cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
         split_kwargs={},
     )
-    model = RandomForestClassifier(n_estimators=8, max_depth=5,
-                                   random_state=42, n_jobs=1)
+    model = RandomForestClassifier(**FOREST_PARAMS)
     predictions = X.skb.apply(model, y=y - 1)
     return predictions.skb.apply_func(restore_original_labels, st.eval_mode())
 
@@ -56,8 +62,7 @@ def test_cover_pipeline_scores_generated_csv(tmp_path, selector):
     frame.to_csv(path, index=False)
     filtered = frame.loc[frame["Cover_Type"] != 7].reset_index(drop=True)
     expected = cross_val_score(
-        RandomForestClassifier(n_estimators=8, max_depth=5,
-                               random_state=42, n_jobs=1),
+        RandomForestClassifier(**FOREST_PARAMS),
         filtered.drop(columns=["Id", "Cover_Type"]),
         filtered["Cover_Type"],
         cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
@@ -65,11 +70,12 @@ def test_cover_pipeline_scores_generated_csv(tmp_path, selector):
     ).mean()
 
     with st.config_context(eager_data_ops=False), st.config(
-            scheduler=True, implementation_selector=selector, debug_graph=True):
+            scheduler=True, implementation_selector=selector, debug_graph=False):
         predictions = build_pipeline(path)
         ops, *_ = optimize(predictions, OptConfig(dataframe_ops=True))
         if selector == "greedy":
             assert any(isinstance(op, PolarsReadCSV) for op in ops)
+            assert any(isinstance(op, SklearnRandomForest) for op in ops)
         search = predictions.skb.make_grid_search(
             n_jobs=1, fitted=True, refit=False, scoring="accuracy")
 
