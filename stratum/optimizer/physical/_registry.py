@@ -16,6 +16,8 @@ lowering unchanged (e.g. ``TransformerOp``). ``supports``/``cost``/``exec_mem``
 form the fixed selector-facing API; ``impl_class`` names the concrete
 ``PhysicalOp`` the op is swapped to when this impl is chosen (identity preserved),
 after which its ``on_impl_selected`` folds in any plan-time state.
+``implementation_name`` distinguishes algorithms sharing one backend, such as
+the exact and histogram Rust random forests.
 
 This is the shared, backend-agnostic schema. A backend that carries extra
 scheduling metadata *subclasses* this (e.g., :class:`RustPhysicalImpl`) instead of
@@ -32,6 +34,17 @@ class PhysicalImpl:
     execute: Callable[[IRNode, str, list[Any]], Any]
     # Concrete PhysicalOp class the op is swapped to when this impl is chosen.
     impl_class: type | None = None
+    # Stable algorithm identity within a backend (for example rf_exact/rf_hist).
+    implementation_name: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.implementation_name is None:
+            name = (
+                self.impl_class.__name__
+                if self.impl_class is not None
+                else self.backend_name
+            )
+            object.__setattr__(self, "implementation_name", name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,7 +151,8 @@ _DECORATED_IMPLS: list[PhysicalImpl] = []
 
 
 def physical_impl(of: type[IRNode], backend: BackendName,
-                  input_format: str = "frame", output_format: str = "frame"):
+                  input_format: str = "frame", output_format: str = "frame",
+                  implementation_name: str | None = None):
     """Class decorator registering a concrete PhysicalOp as a base PhysicalImpl.
 
     ``of`` is the (abstract) op type the class implements, e.g.::
@@ -167,13 +181,15 @@ def physical_impl(of: type[IRNode], backend: BackendName,
             exec_mem=cls.exec_mem,
             execute=_current_process_execute,
             impl_class=cls,
+            implementation_name=implementation_name,
         ))
         return cls
     return deco
 
 
 def rust_impl(of: type[IRNode], input_format: str = "frame",
-              output_format: str = "frame"):
+              output_format: str = "frame",
+              implementation_name: str | None = None):
     """Register a native Rust ``PhysicalOp`` as a :class:`RustPhysicalImpl`.
 
     Like :func:`physical_impl`, but builds the Rust-specific registry entry and
@@ -193,6 +209,7 @@ def rust_impl(of: type[IRNode], input_format: str = "frame",
             exec_mem=cls.exec_mem,
             execute=_current_process_execute,
             impl_class=cls,
+            implementation_name=implementation_name,
             releases_gil=cls.releases_gil,
             data_parallel=cls.data_parallel,
         ))
@@ -205,9 +222,11 @@ def rust_impl(of: type[IRNode], input_format: str = "frame",
 # + PhysicalImpl subclass (as Rust has) once it needs backend-specific fields.
 def _backend_impl(backend: BackendName):
     def decorator(of: type[IRNode], input_format: str = "frame",
-                  output_format: str = "frame"):
+                  output_format: str = "frame",
+                  implementation_name: str | None = None):
         return physical_impl(of=of, backend=backend,
-                             input_format=input_format, output_format=output_format)
+                             input_format=input_format, output_format=output_format,
+                             implementation_name=implementation_name)
     return decorator
 
 
@@ -215,27 +234,6 @@ polars_impl = _backend_impl("polars")
 pandas_impl = _backend_impl("pandas")
 numpy_impl = _backend_impl("numpy")
 sklearn_skrub_impl = _backend_impl("sklearn-skrub")
-
-
-def _register_current_estimator_impls(registry: PhysicalRegistry) -> None:
-    # These are transitional registrations for estimator families that do not
-    # have abstract physical operators yet. Once those lowerings land, their
-    # implementations should be keyed by the corresponding physical type.
-    from stratum.optimizer.logical._ops import PredictorOp, TransformerOp
-
-    for op_type in (TransformerOp, PredictorOp):
-        registry.register(
-            PhysicalImpl(
-                op_type=op_type,
-                backend_name="sklearn-skrub",
-                input_format="frame",
-                output_format="frame",
-                supports=lambda op, ctx: True,
-                cost=_placeholder_cost,
-                exec_mem=_placeholder_exec_mem,
-                execute=_current_process_execute,
-            )
-        )
 
 
 """Create the default registry with every known implementation registered."""
@@ -249,17 +247,19 @@ def build_default_physical_registry() -> PhysicalRegistry:
     # standalone registry construction does not depend on optimizer imports.
     from stratum.optimizer.physical import _source_execs  # noqa: F401
     from stratum.optimizer.physical import _transform_execs  # noqa: F401
+    from stratum.optimizer.physical import _predictor_execs  # noqa: F401
     from stratum.optimizer.physical import _concat_execs  # noqa: F401
     from stratum.optimizer.physical import _join_execs  # noqa: F401
     from stratum.optimizer.physical import _aggregation_execs  # noqa: F401
     from stratum.optimizer.physical import _projection_execs  # noqa: F401
+    from stratum.optimizer.physical import _index_execs  # noqa: F401
     from stratum.optimizer.physical import _selection_execs  # noqa: F401
+    from stratum.optimizer.physical import _sort_execs  # noqa: F401
     from stratum.optimizer.physical import _map_execs  # noqa: F401
     from stratum.optimizer.physical import _getitem_execs  # noqa: F401
 
     for impl in _DECORATED_IMPLS:
         registry.register(impl)
-    _register_current_estimator_impls(registry)
     return registry
 
 

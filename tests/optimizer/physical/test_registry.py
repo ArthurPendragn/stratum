@@ -20,10 +20,29 @@ from stratum.optimizer.physical._source_execs import (
     PolarsReadCSV,
     PolarsReadParquet,
 )
+from stratum.optimizer.physical._predictor_execs import (
+    CatBoostOp,
+    DecisionTreeOp,
+    ElasticNetOp,
+    ExtraTreesOp,
+    HistGradientBoostingOp,
+    KNeighborsOp,
+    LassoOp,
+    LightGBMOp,
+    LinearRegressionOp,
+    LogisticRegressionOp,
+    RandomForestOp,
+    StratumExactRandomForestClassifier,
+    StratumHistogramRandomForestClassifier,
+    RidgeOp,
+    SGDOp,
+    XGBoostOp,
+)
 from stratum.optimizer.physical._transform_execs import (RustOneHotEncoder,
                                                         RustStringEncoder,
                                                         SkrubStringEncoder,
-                                                        StringEncoderOp)
+                                                        StringEncoderOp,
+                                                        PassthroughTransformer)
 
 
 def test_default_registry_discovers_registered_operator_types():
@@ -42,17 +61,33 @@ def test_default_registry_discovers_registered_operator_types():
                     StringEncoderOp):
         assert op_type in registry.op_types()
 
-    # StringEncoder migrated to its own physical op, so only OneHotEncoder's
-    # Rust kernel is still keyed on the logical TransformerOp.
-    rust_candidates = registry.candidates_for(TransformerOp, backend_name="rust")
-    sklearn_candidates = registry.candidates_for(TransformerOp, backend_name="sklearn-skrub")
+    # OneHotEncoder's Rust kernel is keyed on the generic physical transformer.
+    rust_candidates = registry.candidates_for(PassthroughTransformer, backend_name="rust")
     assert len(rust_candidates) == 1
     assert all(candidate.backend_name == "rust" for candidate in rust_candidates)
-    assert len(sklearn_candidates) == 1
+    assert not registry.candidates_for(TransformerOp)
     assert len(registry.candidates_for(PredictorOp, backend_name="sklearn-skrub")) == 1
     # The migrated StringEncoder physical op carries both a skrub and a rust impl.
     assert len(registry.candidates_for(StringEncoderOp, backend_name="rust")) == 1
     assert len(registry.candidates_for(StringEncoderOp, backend_name="sklearn-skrub")) == 1
+
+    # Random forests expose exact and histogram Rust variants alongside sklearn.
+    forest_candidates = registry.candidates_for(RandomForestOp)
+    assert {candidate.implementation_name for candidate in forest_candidates} == {
+        "sklearn_rf", "rf_exact", "rf_hist"
+    }
+    assert {
+        candidate.impl_class for candidate in forest_candidates
+        if candidate.backend_name == "rust"
+    } == {StratumExactRandomForestClassifier, StratumHistogramRandomForestClassifier}
+
+    # Every other migrated predictor family carries its sklearn reference impl.
+    for op_type in (ExtraTreesOp, DecisionTreeOp,
+                    HistGradientBoostingOp, KNeighborsOp, LinearRegressionOp,
+                    RidgeOp, LassoOp, ElasticNetOp, LogisticRegressionOp, SGDOp,
+                    LightGBMOp, XGBoostOp, CatBoostOp):
+        (candidate,) = registry.candidates_for(op_type)
+        assert candidate.backend_name == "sklearn-skrub"
 
     source_candidates = {
         ReadCSV: {PandasReadCSV, PolarsReadCSV},
@@ -64,11 +99,10 @@ def test_default_registry_discovers_registered_operator_types():
 
 
 def test_rust_kernels_are_class_based_impls():
-    # After unification every Rust kernel is a class-based @rust_impl: OneHotEncoder
-    # is still keyed on the logical TransformerOp, StringEncoder on its own op.
+    # Every Rust kernel is a class-based @rust_impl.
     registry = build_default_physical_registry()
 
-    ohe_rust = registry.candidates_for(TransformerOp, backend_name="rust")
+    ohe_rust = registry.candidates_for(PassthroughTransformer, backend_name="rust")
     se_rust = registry.candidates_for(StringEncoderOp, backend_name="rust")
 
     assert len(ohe_rust) == 1 and ohe_rust[0].impl_class is RustOneHotEncoder
@@ -93,6 +127,13 @@ def test_rust_impl_is_its_own_dataclass_with_capability_hints():
     assert type(skrub) is PhysicalImpl
     assert skrub.impl_class is SkrubStringEncoder
     assert not hasattr(skrub, "releases_gil")
+
+
+def test_implementation_name_defaults_to_concrete_class_name():
+    registry = build_default_physical_registry()
+    (rust,) = registry.candidates_for(StringEncoderOp, backend_name="rust")
+
+    assert rust.implementation_name == RustStringEncoder.__name__
 
 
 def test_registry_registers_and_queries_impls_by_registered_type():

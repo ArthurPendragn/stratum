@@ -8,11 +8,12 @@ from .logical._op_cse import apply_op_cse
 from .logical._dataframe_ops import extract_dataframe_op, add_splitting_op
 from .logical._numeric_ops import extract_numeric_op
 from .logical._candidate_ops import CollectCandidatesOp, ScoreCandidatesOp
-from .logical._ops import BaseEstimatorOp, ChoiceOp, Op, OperandRef, as_op
+from .logical._ops import BaseEstimatorOp, ChoiceOp, Op, OperandRef, as_op, check_choices_not_shared
 from .logical._split_ops import SplitOutput
 from ._op_utils import clone_sub_dag, find_choice_naive, replace_op_in_outputs, show_graph, topological_iterator, validate_dag
 from ._explain import explain_linear_plan
 from .logical._algebraic_rewrites import algebraic_rewrites, AlgebraicRewritesConfig
+from .logical._relational_rewrites import relational_rewrites
 from ._linearization import linearize_dag
 from ._fit_pass_planning import mark_fit_dead_ops
 from ._input_removal_planning import compute_pinned_ops, plan_input_removals
@@ -22,6 +23,8 @@ from .physical._impl_selection import (ImplementationSelector, get_implementatio
 # Importing the physical exec modules and their lowering rules.
 from .physical import _source_execs  # noqa: F401
 from .physical import _transform_execs  # noqa: F401
+from .physical import _predictor_execs  # noqa: F401
+from .physical import _generic_execs  # noqa: F401
 from stratum.frontend._skrub_graph import build_graph
 import logging
 from stratum._config import FLAGS
@@ -73,16 +76,35 @@ class OptConfig():
         algebraic_rewrites: bool = True,
         algebraic_rewrite_config: AlgebraicRewritesConfig | None = None,
         propagate_schema: bool = True,
+        semi_join_rewrite: bool = True,
+        selector: ImplementationSelector | None = None,
+        pandas_query: bool = False,
     ):
+        """``selector`` overrides the implementation-selection policy for this
+        plan. Left ``None``, the policy named by ``FLAGS.implementation_selector``
+        is used, which is the only route users have. Passing one is how a caller
+        reaches a policy that has no config name -- notably
+        ``FlagBasedSelector(backend="polars")``, which pins a plan to one
+        dataframe backend so the polars impls can be exercised directly.
+
+        ``pandas_query`` lets ``PandasQuerySelectionOp`` bid for a MASK selection
+        whose predicate compiles to a query string. It lives here, on the
+        optimizer's own config, because it is a technical impl choice between two
+        pandas selection kernels rather than anything a user should reason about:
+        no ``set_config`` parameter reaches it, and ``make_grid_search`` (a skrub
+        drop-in, ADR 0002) builds its plan with the default."""
         self.cse = cse
         self.dataframe_ops = dataframe_ops
         self.unroll_choices = unroll_choices
         self.numeric_ops = numeric_ops
         self.algebraic_rewrites = algebraic_rewrites
+        self.semi_join_rewrite = semi_join_rewrite
         if algebraic_rewrite_config is None:
             algebraic_rewrite_config = AlgebraicRewritesConfig()
         self.algebraic_rewrite_config = algebraic_rewrite_config
         self.propagate_schema = propagate_schema
+        self.selector = selector
+        self.pandas_query = pandas_query
 
 def _debug_show_graph(root: Op, name: str):
     if FLAGS.debug_graph:
@@ -140,7 +162,7 @@ def optimize(dag_root: DataOp, config: OptConfig = None, env: dict = None,
 
     # Steps 2 & 3 read the config that drives operator selection once, here, so
     # execution carries no operator-selection control flow.
-    ctx = PlanContext.from_flags()
+    ctx = PlanContext.from_flags(config)
 
     # Step 2: lower logical ops to physical ops.
     root = lower_to_physical(root, ctx)
@@ -150,7 +172,7 @@ def optimize(dag_root: DataOp, config: OptConfig = None, env: dict = None,
 
     # Step 3: physical optimization (implementation selection + linearization).
     # TODO: May need physical-level rewrites before or after operator selection
-    result = physical_optimize(root, ctx)
+    result = physical_optimize(root, ctx, selector=config.selector)
 
     log_time("Optimization took in total", start)
     return result
@@ -189,6 +211,11 @@ def logical_optimize(dag_root: DataOp, config: OptConfig, env: dict = None,
     if config.algebraic_rewrites:
         root = algebraic_rewrites(root, config.algebraic_rewrite_config)
         _debug_show_graph(root, "algebraic_rewrite")
+
+    # Shape rewrites after the expression ones, and after CSE, so the build side
+    # a promoted join reads is already shared with whatever else produced it.
+    root = relational_rewrites(root, semi_join=config.semi_join_rewrite)
+    _debug_show_graph(root, "relational_rewrite")
 
     # Last, so every rewrite above sees the plan shape it was written against. A plan
     # whose choices were not unrolled is not an executable candidate set, so it gets no
@@ -281,6 +308,7 @@ def convert_to_ops(dag: DataOp, env: dict = None) -> Op:
     """
     start = start_time()
     children, nodes, parents = get_dataops_graph(dag)
+    check_choices_not_shared(nodes.values())
     order = topological_traverse(nodes, parents, children)
     root_id = order[-1]
 

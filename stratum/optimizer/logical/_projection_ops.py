@@ -3,6 +3,7 @@ from skrub.selectors._base import make_selector
 from stratum.optimizer.logical._ops import (OutputType, CallOp, GetAttrOp,
                                        MethodCallOp, Op, TransformerOp, _resolve_args, _resolve_kwargs)
 from stratum.optimizer.logical import _schema
+from stratum.optimizer.logical._index_ops import IndexAccessOp
 import polars as pl
 
 
@@ -96,6 +97,24 @@ class MetadataOp(Op):
         else:
             mapping = None  # e.g. a graph-fed axis: can't tell which way it renames
         self.output_schema = _schema.rename_columns(self.inputs[0].output_schema, mapping)
+
+
+def make_reset_index_op(op: MethodCallOp) -> MetadataOp | None:
+    """Fuse ``reset_index(drop=True)`` into a :class:`MetadataOp`.
+
+    Only the dropping form. ``drop=False`` promotes the index to a column and so
+    changes the schema, which we cannot describe until schema propagation exists,
+    and it is also pandas' default, so it is refused rather than guessed at.
+    """
+    kwargs = dict(op.kwargs or {})
+    if op.args or kwargs.pop("drop", False) is not True or kwargs:
+        return None
+    new_op = MetadataOp(func="reset_index", args=(), kwargs={"drop": True},
+                        inputs=op.inputs, outputs=op.outputs)
+    # reset_index keeps the container kind: a series stays a series.
+    new_op.output_type = op.inputs[0].output_type
+    op.replace_output_of_inputs(new_op)
+    return new_op
 
 
 class ProjectionOp(Op):
@@ -415,8 +434,26 @@ def make_datetime_conversion_op(op: CallOp) -> DatetimeConversionOp:
     return new_op
 
 
-def make_frame_get_attr(new_op: GetAttrProjectionOp, op: GetAttrOp) -> GetAttrProjectionOp:
+def _get_attr_output_type(attr_name: list, container: Op) -> OutputType:
+    """The kind an attribute access produces.
+
+    ``.index`` is a sequence of labels whatever it is read off, so it is a SERIES
+    even when the container is a frame. There is no ``Index`` member in the
+    lattice and it would have no readers: every consumer we have treats an index
+    as a sequence of values. Every other accessor (``.dt.year``, ``.str``, ...)
+    keeps the container's own kind.
+    """
+    if attr_name == ["index"]:
+        return OutputType.SERIES
+    return container.output_type
+
+
+def make_frame_get_attr(new_op: GetAttrProjectionOp, op: GetAttrOp) -> Op:
     input_ = op.inputs[0]
+    if op.attr_name == "index" or op.attr_name == ["index"]:
+        index_op = IndexAccessOp(inputs=op.inputs, outputs=op.outputs)
+        op.replace_output_of_inputs(index_op)
+        return index_op
     if isinstance(input_, GetAttrProjectionOp):
         # Fuse chained GetAttr operations
         concat_attr_name = input_.attr_name.copy()
@@ -425,9 +462,7 @@ def make_frame_get_attr(new_op: GetAttrProjectionOp, op: GetAttrOp) -> GetAttrPr
 
         new_input = input_.inputs[0]
         new_op = GetAttrProjectionOp(attr_name=concat_attr_name, inputs=[new_input], outputs=op.outputs)
-        # Attribute access (e.g. `.dt.year`, `.str...`) keeps the container's
-        # tabular kind: a series stays a series, a frame stays a frame.
-        new_op.output_type = new_input.output_type
+        new_op.output_type = _get_attr_output_type(concat_attr_name, new_input)
 
         if len(input_.outputs) > 1:
             input_.outputs.remove(op)
@@ -439,7 +474,7 @@ def make_frame_get_attr(new_op: GetAttrProjectionOp, op: GetAttrOp) -> GetAttrPr
         # Convert single GetAttrOp to GetAttrDataframeOp
         attr_name = op.attr_name if isinstance(op.attr_name, list) else [op.attr_name]
         new_op = GetAttrProjectionOp(attr_name=attr_name, inputs=op.inputs, outputs=op.outputs)
-        new_op.output_type = input_.output_type
+        new_op.output_type = _get_attr_output_type(attr_name, input_)
         op.replace_output_of_inputs(new_op)
     return new_op
 

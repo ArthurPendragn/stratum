@@ -1,16 +1,17 @@
 from __future__ import annotations
+from numbers import Number
 from types import SimpleNamespace
 from typing import Callable
 
 from joblib import parallel_config
 from sklearn import clone
 from sklearn.base import BaseEstimator
-from skrub._data_ops._choosing import BaseChoice, Choice, Match
-from skrub._data_ops._data_ops import DataOp, Apply, Value, CallMethod, Call, GetAttr, GetItem, BinOp as SkrubBinOp, UnaryOp as SkrubUnaryOp, Concat, Var, _wrap_estimator
+from skrub._data_ops._choosing import BaseChoice, Choice, DiscretizedNumericChoice, Match
+from skrub._data_ops._data_ops import DataOp, Apply, Value, CallMethod, Call, GetAttr, GetItem, BinOp as SkrubBinOp, UnaryOp as SkrubUnaryOp, Concat, SplitX, Var, _wrap_estimator
 from skrub._utils import PassThrough
 from pandas import DataFrame
 import polars as pl
-from polars import DataFrame as PlDataFrame, Series as PlSeries
+from polars import DataFrame as PlDataFrame
 from stratum.frontend._skrub_graph import _collect_child_data_ops
 from stratum.optimizer.logical import _schema
 # Shared IR foundation. Re-exported below so existing ``from ..._ops import X``
@@ -195,6 +196,26 @@ class ImplOp(Op):
             ns = self.replace_fields_with_values(inputs)
             return self.skrub_impl.compute(ns, mode, {})
 
+
+class SplitXOp(Op):
+    """Temporary X boundary carrying skrub's declared splitter until split planning."""
+
+    def __init__(self, skrub_impl: SplitX):
+        super().__init__(name="X", is_X=True)
+        self.skrub_impl = skrub_impl
+
+    @property
+    def operand_index(self) -> dict:
+        return _operand_index_from_impl(self.skrub_impl)
+
+    @property
+    def source(self) -> Op:
+        return self.inputs[self.operand_index[id(self.skrub_impl.X)]]
+
+    def process(self, mode: str, inputs: list):
+        raise RuntimeError("SplitXOp should be replaced by the splitting rewrite before execution")
+
+
 class VariableOp(Op):
     def __init__(self, name: str, value = None):
         super().__init__(name=name)
@@ -329,9 +350,16 @@ class BaseEstimatorOp(Op):
         x = inputs[0]
         assert x is not None, f"X is None for {self}"
         y = (inputs[self.y.k] if isinstance(self.y, OperandRef) else self.y) if fitting else None
-        estm = self.original_estimator if fitting else self.estimator
+        # Every fit starts from an unfitted clone, as in skrub. Fitting the prototype
+        # itself would leave it fitted for the next fold, and CatBoost refuses the
+        # `set_params` below on a fitted model.
+        estm = clone(self.original_estimator) if fitting else self.estimator
         place_holders = {name: inputs[ref.k] for name, ref in self.param_refs.items()}
-        estm.set_params(**place_holders)
+        # Graph-fed hyperparameters configure the estimator before fitting. In a
+        # response pass ``estm`` is already fitted, and CatBoost rejects any
+        # ``set_params`` call at that point (even an empty one).
+        if fitting and place_holders:
+            estm.set_params(**place_holders)
         cols = inputs[self.cols.k] if isinstance(self.cols, OperandRef) else self.cols
         # A response pass never fits, so (like skrub) the fit group is left unevaluated.
         # Note the difference from skrub: skrub also never *computes* what that group
@@ -382,6 +410,9 @@ class TransformerOp(BaseEstimatorOp):
     # group never applies to one; predict mode calls transform().
     fit_kwargs_key = "fit_transform"
     call_kwargs_key = "transform"
+
+    def process(self, mode: str, inputs: list):
+        raise NotImplementedError("TransformerOp must be lowered before execution")
 
     def get_process_task(self):
         return process_transformer_task
@@ -520,11 +551,6 @@ class ValueOp(Op):
     def clone(self):
         raise ValueError(f"We should not clone ValueOp objects.")
 
-    def process(self, mode: str, inputs: list):
-        out = self.value
-        self.value = None
-        return out
-
 class MethodCallOp(Op):
     fields = ["method_name", "args", "kwargs"]
     
@@ -535,15 +561,6 @@ class MethodCallOp(Op):
         self.method_name = method_name
         self.args = args
         self.kwargs = kwargs
-
-    def process(self, mode: str, inputs: list):
-        # The object the method is called on is the implicit primary operand (index 0).
-        _obj = inputs[0]
-        _args = _resolve_args(self.args, inputs)
-        _kwargs = _resolve_kwargs(self.kwargs, inputs)
-        if self.method_name == "apply" and isinstance(_obj, PlSeries):
-            return _obj.map_elements(*_args, **_kwargs)
-        return _obj.__getattribute__(self.method_name)(*_args, **_kwargs)
 
 class CallOp(Op):
     fields = ["func", "args", "kwargs"]
@@ -557,11 +574,6 @@ class CallOp(Op):
         self.func = func
         self.args = args
         self.kwargs = kwargs
-
-    def process(self, mode: str, inputs: list):
-        _args = _resolve_args(self.args, inputs)
-        _kwargs = _resolve_kwargs(self.kwargs, inputs)
-        return self.func(*_args, **_kwargs)
 
 class GetAttrOp(Op):
     fields = ["attr_name"]
@@ -814,30 +826,168 @@ def _outcome_display(estimator) -> str:
     return type(estimator).__name__
 
 
-def _flatten_estimator_choice(choice: Choice):
-    """Flatten an estimator ``Choice`` (possibly nesting further Choices) into leaves.
+# skrub resolves choices nested in these exact types, not in their subclasses (it
+# would not know how to rebuild one), so neither does the expansion below.
+_CHOICE_CONTAINERS = (list, tuple, set, frozenset)
 
-    Yields ``(name_path, estimator)`` per leaf estimator, where ``name_path`` is a
-    list of ``(choice_name, value)`` pairs -- ChoiceOp's internal ``outcome_names``
-    representation -- so a nested choice collapses into a single flat ChoiceOp over
-    all leaf estimators, matching how skrub expands its parameter grid. An
-    intermediate (nested) choice only contributes to the path when its outcome is
-    named; the leaf always contributes its outcome name or estimator class name.
+
+def _iter_choices(value):
+    """Yield every choice (or ``Match``) in ``value`` that skrub would resolve.
+
+    Walks what skrub's evaluation walks: a choice's outcomes, an estimator's
+    parameters, and the built-in containers. DataOps are not entered: they are
+    graph nodes, converted on their own.
     """
-    for i, outcome in enumerate(choice.outcomes):
-        label = choice.outcome_names[i] if choice.outcome_names is not None else None
-        if isinstance(outcome, Choice):
-            prefix = [(choice.name, label)] if label is not None else []
-            for sub_path, est in _flatten_estimator_choice(outcome):
-                yield prefix + sub_path, est
-        elif isinstance(outcome, DataOp):
+    if isinstance(value, Match):
+        yield value
+    elif isinstance(value, BaseChoice):
+        yield value
+        if isinstance(value, Choice):
+            for outcome in value.outcomes:
+                yield from _iter_choices(outcome)
+    elif isinstance(value, BaseEstimator):
+        yield from _iter_choices(value.get_params(deep=False))
+    elif type(value) is dict:
+        for v in value.values():
+            yield from _iter_choices(v)
+    elif type(value) in _CHOICE_CONTAINERS:
+        for v in value:
+            yield from _iter_choices(v)
+
+
+def _contains_choice(value) -> bool:
+    return next(_iter_choices(value), None) is not None
+
+
+def _outcome_label(outcome, index: int, estimator_slot: bool) -> str:
+    """Name of an unnamed choice outcome in a grid point's name path.
+
+    In the estimator slot, the outcome is the estimator (None/'passthrough' mean a
+    PassThrough); inside an estimator's parameters it is the parameter value.
+    """
+    if estimator_slot:
+        return _outcome_display(outcome)
+    if isinstance(outcome, BaseEstimator):
+        return type(outcome).__name__
+    if outcome is None or isinstance(outcome, (Number, str)):
+        return str(outcome)
+    name = getattr(outcome, "__name__", None)  # functions and classes
+    # Anything else gets the positional label Value(Choice) outcomes get.
+    return name if isinstance(name, str) else f"Opt{index}"
+
+
+def _expand_choice_outcomes(choice, outcomes, outcome_names, chosen: dict,
+                            estimator_slot: bool):
+    key = id(choice)
+    if key in chosen:
+        # skrub keys a choice by identity: every use of one choice object takes the
+        # same outcome, and it is one grid dimension, so it adds nothing to the name.
+        yield from _expand_choices(outcomes[chosen[key]], chosen, estimator_slot)
+        return
+    for i, outcome in enumerate(outcomes):
+        if isinstance(outcome, DataOp):
             raise NotImplementedError(
-                "Apply with a Choice estimator only supports concrete estimator "
-                "(or None/'passthrough') outcomes; DataOp outcomes are not "
-                f"supported (choice {choice.name!r}).")
+                "A choice in the estimator of `.skb.apply()` only supports concrete "
+                "outcomes (estimators, None/'passthrough' or parameter values); "
+                f"DataOp outcomes are not supported (choice {choice.name!r}).")
+        named = outcome_names is not None
+        label = outcome_names[i] if named else _outcome_label(outcome, i, estimator_slot)
+        # An unnamed nested choice is described by its own outcomes; the leaf always
+        # contributes, so every grid point gets a name.
+        prefix = [] if isinstance(outcome, BaseChoice) and not named else [(choice.name, label)]
+        for path, concrete, now_chosen in _expand_choices(outcome, {**chosen, key: i},
+                                                          estimator_slot):
+            yield prefix + path, concrete, now_chosen
+
+
+def _expand_items(items: list, chosen: dict):
+    """The Cartesian product of the expansions of ``items``, in order."""
+    if not items:
+        yield [], [], chosen
+        return
+    for head_path, head, head_chosen in _expand_choices(items[0], chosen, False):
+        for tail_path, tail, tail_chosen in _expand_items(items[1:], head_chosen):
+            yield head_path + tail_path, [head] + tail, tail_chosen
+
+
+def _expand_choices(value, chosen: dict, estimator_slot: bool):
+    """Yield ``(name_path, concrete_value, chosen)`` for every grid point of ``value``.
+
+    ``name_path`` is a list of ``(choice_name, outcome_label)`` pairs, ChoiceOp's
+    internal ``outcome_names`` format. ``chosen`` maps ``id(choice)`` to the outcome
+    fixed for it so far on this grid point. The grid is conditional, as skrub's: a
+    choice nested in an outcome only varies when that outcome is taken.
+    """
+    if isinstance(value, Match):
+        raise NotImplementedError(
+            "`.match()` on a choice inside the estimator of `.skb.apply()` is not "
+            f"supported yet (it matches choice {value.choice.name!r}).")
+    if isinstance(value, Choice):
+        yield from _expand_choice_outcomes(value, value.outcomes, value.outcome_names,
+                                           chosen, estimator_slot)
+    elif isinstance(value, DiscretizedNumericChoice):
+        yield from _expand_choice_outcomes(value, list(value.grid), None, chosen, False)
+    elif isinstance(value, BaseChoice):
+        raise NotImplementedError(
+            f"{value!r} is a continuous range, which a grid search cannot enumerate. "
+            "Pass `n_steps` to search a grid of values from it.")
+    elif not _contains_choice(value):
+        # Returned as is, so an estimator without a choice keeps its identity.
+        yield [], value, chosen
+    elif isinstance(value, BaseEstimator):
+        for path, params, now_chosen in _expand_choices(value.get_params(deep=False),
+                                                        chosen, False):
+            # As skrub's `handle_estimator`: a clone configured with the resolved params.
+            estimator = clone(value)
+            estimator.set_params(**params)
+            yield path, estimator, now_chosen
+    elif type(value) is dict:
+        for path, items, now_chosen in _expand_items(list(value.values()), chosen):
+            yield path, dict(zip(value.keys(), items)), now_chosen
+    else:
+        for path, items, now_chosen in _expand_items(list(value), chosen):
+            yield path, type(value)(items), now_chosen
+
+
+def _expand_estimator_choices(estimator) -> list[tuple[list, object]]:
+    """Expand every choice in an Apply's estimator into ``(name_path, estimator)`` leaves.
+
+    The choices may be the estimator itself (possibly nesting further choices) or sit
+    in its parameters at any depth, e.g. ``LogisticRegression(C=choose_from(...))`` or
+    a ``Pipeline`` step. All of them collapse into one flat list of concrete
+    estimators, one per point of the parameter grid skrub would search. An
+    intermediate (nested) choice only contributes to the path when its outcome is
+    named; a leaf always contributes its outcome name or a label for its value.
+    """
+    return [(path, est) for path, est, _ in _expand_choices(estimator, {}, True)]
+
+
+def check_choices_not_shared(data_ops) -> None:
+    """Refuse a choice object that more than one operator depends on.
+
+    skrub keys a choice by identity, so one ``choose_from`` used in two places is a
+    single grid dimension: both uses always take the same outcome. Conversion expands
+    the choices of each Apply on its own, which would search the uses independently,
+    a different grid, so this is refused rather than silently diverging from skrub.
+    """
+    owners = {}
+    for data_op in data_ops:
+        impl = data_op._skrub_impl
+        if isinstance(impl, Apply):
+            found = [c for c in _iter_choices(impl.estimator) if isinstance(c, BaseChoice)]
+        elif isinstance(impl, Value) and isinstance(impl.value, Choice):
+            found = [impl.value]
         else:
-            value = label if label is not None else _outcome_display(outcome)
-            yield [(choice.name, value)], outcome
+            continue
+        for choice in {id(c): c for c in found}.values():
+            owner = owners.setdefault(id(choice), data_op)
+            if owner is not data_op:
+                raise NotImplementedError(
+                    f"The choice {choice!r} is used by more than one operator "
+                    f"({owner.__skrub_short_repr__()} and "
+                    f"{data_op.__skrub_short_repr__()}). skrub searches it as one "
+                    "parameter, so every use takes the same outcome; stratum does not "
+                    "support that yet.")
 
 
 # TODO: Move this to frontend package
@@ -904,14 +1054,16 @@ def as_op(data_op: DataOp, ids_to_ops: dict, env: dict | None = None) -> Op:
         return_op = UnaryOp(op=impl.op, operand=operand)
         return_op.inputs = binder.inputs
     elif isinstance(impl, Apply):
-        if isinstance(impl.estimator, Choice):
-            # An estimator choice expands to a ChoiceOp over one estimator op per
-            # outcome (mirroring Value(Choice) above), so choice unrolling and
-            # grid search work over the alternatives. Nested estimator choices are
-            # flattened into a single ChoiceOp over all leaf estimators; the leaf
-            # name paths use ChoiceOp's combi format so they concatenate correctly
-            # if choice_unrolling later combines this choice with a downstream one.
-            leaves = list(_flatten_estimator_choice(impl.estimator))
+        if _contains_choice(impl.estimator):
+            # The choices in an estimator -- the estimator itself, or ones nested in
+            # its parameters -- expand to a ChoiceOp over one estimator op per grid
+            # point (mirroring Value(Choice) above), so choice unrolling and grid
+            # search work over the alternatives and every op after conversion holds
+            # concrete parameters. All of them are flattened into a single ChoiceOp;
+            # the leaf name paths use ChoiceOp's combi format so they concatenate
+            # correctly if choice_unrolling later combines this choice with a
+            # downstream one.
+            leaves = _expand_estimator_choices(impl.estimator)
             outcome_ops = [_apply_estimator_op(impl, est, ids_to_ops) for _, est in leaves]
             for est_op in outcome_ops:
                 # The trailing edge-wiring below only covers the returned op.
@@ -921,6 +1073,12 @@ def as_op(data_op: DataOp, ids_to_ops: dict, env: dict | None = None) -> Op:
                                  append_choice_name=False, inputs=outcome_ops)
         else:
             return_op = _apply_estimator_op(impl, impl.estimator, ids_to_ops)
+    elif isinstance(impl, SplitX):
+        for field_name in impl._fields:
+            for child in _collect_child_data_ops(getattr(impl, field_name)):
+                binder.ref(child)
+        return_op = SplitXOp(impl)
+        return_op.inputs = binder.inputs
     elif isinstance(impl, Var):
         if env is not None and impl.name in env:
             # Resolve the variable to a compile-time constant; the runtime no

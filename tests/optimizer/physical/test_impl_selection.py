@@ -22,6 +22,7 @@ from stratum.optimizer.physical._impl_selection import (
     DefaultImplementationSelector,
     FlagBasedSelector,
     GreedyImplementationSelector,
+    bind_op,
     get_implementation_selector,
     select_implementations,
 )
@@ -44,9 +45,9 @@ from stratum.optimizer.physical._transform_execs import StringEncoderOp
 from stratum.optimizer.logical._ops import Op, ValueOp
 
 
-def _ctx(backend="pandas", rust=False):
-    return PlanContext(backend=backend, pandas_query=False, rechunk=True,
-                       parallelism=1, rust_backend=rust, allow_patch=True)
+def _ctx(rust=False, allow_patch=True):
+    return PlanContext(pandas_query=False, rechunk=True, parallelism=1,
+                       rust_backend=rust, allow_patch=allow_patch)
 
 
 def _impl(op_type, backend, supports=lambda op, ctx: True, impl_class=None):
@@ -76,12 +77,39 @@ class TestFlagBasedSelector(unittest.TestCase):
         selector = FlagBasedSelector()
         rust = _impl(DummyOp, "rust")
         generic = _impl(DummyOp, "sklearn-skrub")
-        ctx = PlanContext(backend="pandas", pandas_query=False, rechunk=True,
+        ctx = PlanContext(pandas_query=False, rechunk=True,
                           parallelism=1, rust_backend=True, allow_patch=False)
         self.assertIs(generic, selector.choose(DummyOp(), [rust, generic], ctx))
 
     def test_no_candidates_returns_none(self):
         self.assertIsNone(FlagBasedSelector().choose(DummyOp(), [], _ctx()))
+
+    def test_backend_is_selector_state_not_plan_context(self):
+        pandas = _impl(DummyOp, "pandas")
+        polars = _impl(DummyOp, "polars")
+        candidates = [pandas, polars]
+        # One plan context, two selectors, two different binds: the backend
+        # travels with the selector, which is what makes it selectable at all.
+        self.assertIs(pandas, FlagBasedSelector().choose(
+            DummyOp(), candidates, _ctx()))
+        self.assertIs(polars, FlagBasedSelector(backend="polars").choose(
+            DummyOp(), candidates, _ctx()))
+
+    def test_backend_agnostic_impl_serves_either_backend(self):
+        sklearn = _impl(DummyOp, "sklearn-skrub")
+        numpy = _impl(DummyOp, "numpy")
+        for backend in ("pandas", "polars"):
+            selector = FlagBasedSelector(backend=backend)
+            self.assertIs(sklearn, selector.choose(DummyOp(), [sklearn], _ctx()))
+            self.assertIs(numpy, selector.choose(DummyOp(), [numpy], _ctx()))
+
+    def test_pin_is_strict_when_no_candidate_matches(self):
+        # No impl on the pinned backend and none backend-agnostic: the op is
+        # left unbound rather than run on the other backend. select_implementations
+        # then fails the plan for an abstract op (see TestAbstractOpGuard).
+        selector = FlagBasedSelector(backend="polars")
+        self.assertIsNone(
+            selector.choose(DummyOp(), [_impl(DummyOp, "pandas")], _ctx()))
 
 
 class TestDefaultImplementationSelector(unittest.TestCase):
@@ -98,7 +126,7 @@ class TestDefaultImplementationSelector(unittest.TestCase):
             with st.config(implementation_selector="unknown"):
                 pass
 
-    def test_preference_order_is_independent_of_plan_backend(self):
+    def test_preference_order(self):
         selector = DefaultImplementationSelector()
         pandas = _impl(DummyOp, "pandas")
         polars = _impl(DummyOp, "polars")
@@ -107,7 +135,7 @@ class TestDefaultImplementationSelector(unittest.TestCase):
         rust = _impl(DummyOp, "rust")
 
         self.assertIs(pandas, selector.choose(
-            DummyOp(), [rust, polars, numpy, sklearn, pandas], _ctx("polars")))
+            DummyOp(), [rust, polars, numpy, sklearn, pandas], _ctx()))
         self.assertIs(sklearn, selector.choose(
             DummyOp(), [rust, polars, numpy, sklearn], _ctx()))
         self.assertIs(numpy, selector.choose(
@@ -130,7 +158,7 @@ class TestGreedyImplementationSelector(unittest.TestCase):
                 get_implementation_selector("greedy"),
                 GreedyImplementationSelector)
 
-    def test_preference_order_is_independent_of_plan_backend(self):
+    def test_preference_order(self):
         selector = GreedyImplementationSelector()
         pandas = _impl(DummyOp, "pandas")
         polars = _impl(DummyOp, "polars")
@@ -139,7 +167,7 @@ class TestGreedyImplementationSelector(unittest.TestCase):
         rust = _impl(DummyOp, "rust")
 
         self.assertIs(rust, selector.choose(
-            DummyOp(), [pandas, sklearn, numpy, polars, rust], _ctx("pandas")))
+            DummyOp(), [pandas, sklearn, numpy, polars, rust], _ctx()))
         self.assertIs(polars, selector.choose(
             DummyOp(), [pandas, sklearn, numpy, polars], _ctx()))
         self.assertIs(numpy, selector.choose(
@@ -263,6 +291,49 @@ class TestRelationalImplementationSelection(unittest.TestCase):
                     selector=GreedyImplementationSelector(),
                 )
                 self.assertIsInstance(op, expected_impl)
+
+
+class TestUnrunnableOpsFailAtPlanTime(unittest.TestCase):
+    """An operator nothing can run must say so while planning, not while running.
+
+    The frame families are pure config with no ``process`` of their own, so an
+    unbound one used to surface as a bare NotImplementedError from the base class
+    at execution, far from the decision that caused it.
+    """
+
+    def _registry(self, *impls):
+        return PhysicalRegistry(impls)
+
+    def test_every_backend_refusing_is_a_plan_time_error(self):
+        registry = self._registry(_impl(SelectionOp, "pandas",
+                                        supports=lambda op, ctx: False))
+        with self.assertRaises(NotImplementedError) as cm:
+            bind_op(SelectionOp(kind=SelectionKind.MASK), _ctx(),
+                    registry=registry, selector=DefaultImplementationSelector())
+        self.assertIn("refused", str(cm.exception))
+
+    def test_a_backend_mismatch_is_a_plan_time_error(self):
+        # Nothing refused, but the selector is pinned to a backend none of the
+        # supported impls provide.
+        registry = self._registry(_impl(SelectionOp, "pandas"))
+        with self.assertRaises(NotImplementedError) as cm:
+            bind_op(SelectionOp(kind=SelectionKind.MASK), _ctx(),
+                    registry=registry, selector=FlagBasedSelector(backend="polars"))
+        self.assertIn("polars", str(cm.exception))
+
+    def test_an_op_that_can_run_itself_is_left_alone(self):
+        # The estimator families do define `process`, so an optional accelerator
+        # refusing them is not an error.
+        registry = self._registry(_impl(DummyOp, "rust",
+                                        supports=lambda op, ctx: False))
+        op = DummyOp()
+        self.assertIs(op, bind_op(op, _ctx(), registry=registry,
+                                  selector=DefaultImplementationSelector()))
+
+    def test_an_op_with_no_registered_impl_is_left_alone(self):
+        op = SelectionOp(kind=SelectionKind.MASK)
+        self.assertIs(op, bind_op(op, _ctx(), registry=PhysicalRegistry(),
+                                  selector=DefaultImplementationSelector()))
 
 
 class TestPlanTimeBinding(unittest.TestCase):

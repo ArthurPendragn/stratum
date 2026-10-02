@@ -1,33 +1,22 @@
 import operator
 import unittest
-from contextlib import contextmanager
 
 import pytest
 import pandas as pd
 import polars as pl
 
 import stratum as st
-from stratum._config import FLAGS
 from stratum.optimizer.logical._ops import remap_operand_refs
 from stratum.optimizer._optimize import OptConfig
 from stratum.optimizer.logical._dataframe_ops import (
     ColumnProjectionOp, SelectionKind, SelectionOp)
-from stratum.optimizer.logical._ops import BinOp, GetItemOp, UnaryOp, Op, OperandRef, OutputType
-from stratum.optimizer.logical._column_expr import Col, Const, BinOpExpr, UnaryOpExpr, OperandLeaf, StrExpr
+from stratum.optimizer.logical._ops import (
+    BinOp, GetItemOp, UnaryOp, Op, OperandRef, OutputType, ValueOp)
+from stratum.optimizer.logical._column_expr import (
+    Col, ColumnMethodExpr, Const, BinOpExpr, UnaryOpExpr, OperandLeaf, StrExpr)
 from stratum.optimizer.physical._source_execs import rechunk_pl_frame
 from .test_dataframe_ops import (
-    optimize, run_op, force_polars)
-
-
-@contextmanager
-def pandas_query(enabled=True):
-    """Temporarily set `FLAGS.pandas_query`."""
-    orig = FLAGS.pandas_query
-    FLAGS.pandas_query = enabled
-    try:
-        yield
-    finally:
-        FLAGS.pandas_query = orig
+    optimize, run_op, force_polars, pandas_query, plan_context)
 
 
 class TestSelectionExtraction(unittest.TestCase):
@@ -229,17 +218,55 @@ class TestMaskFolding(unittest.TestCase):
             BinOpExpr(operator.gt, StrExpr(OperandLeaf(OperandRef(1)), "count", ("1",)), Const(0)),
             self._mask(ops).predicate)
 
-    def test_external_operand_folds_to_leaf(self):
-        # df[df["x"] > thr] where `thr` is another data-op: the column folds to Col,
-        # the external operand cannot, so it becomes an OperandLeaf input.
+    def test_graph_fed_scalar_operand_folds_to_const(self):
+        # df[df["x"] > thr] where `thr` is another data-op: it reaches the fold as a
+        # ValueOp input rather than an inline literal, but a scalar ValueOp is
+        # absorbed as a Const, so the selection keeps the source as its only input.
         data = st.as_data_op(self.df)
         thr = st.as_data_op(1)
+        ops = optimize(data[data["x"] > thr], OptConfig(dataframe_ops=True))
+        sel = self._mask(ops)
+        self.assertEqual(BinOpExpr(operator.gt, Col("x"), Const(1)), sel.predicate)
+        self.assertEqual(1, len(sel.inputs))  # [src]; the ValueOp is gone
+        self.assertEqual([], [o for o in ops if isinstance(o, ValueOp)])
+
+    def test_env_resolved_variable_folds_to_const(self):
+        # A Var bound in `env` is resolved to a ValueOp at conversion time, so the
+        # predicate folds exactly as an inline literal would.
+        data = st.as_data_op(self.df)
+        thr = st.var("thr")
+        ops = optimize(data[data["x"] > thr], OptConfig(dataframe_ops=True),
+                       env={"thr": 1})
+        sel = self._mask(ops)
+        self.assertEqual(BinOpExpr(operator.gt, Col("x"), Const(1)), sel.predicate)
+        self.assertEqual(1, len(sel.inputs))
+
+    def test_graph_fed_container_operand_stays_leaf(self):
+        # Only scalars are inlined: Const compiles to pl.lit(), which would turn a
+        # list into one list-valued cell. A container ValueOp stays an input so the
+        # impls' own conversions still see it.
+        data = st.as_data_op(self.df)
+        thr = st.as_data_op([1, 1, 1])
         ops = optimize(data[data["x"] > thr], OptConfig(dataframe_ops=True))
         sel = self._mask(ops)
         self.assertEqual(
             BinOpExpr(operator.gt, Col("x"), OperandLeaf(OperandRef(1))),
             sel.predicate)
         self.assertEqual(2, len(sel.inputs))  # [src, thr]
+
+    def test_shared_graph_fed_constant_stays_leaf(self):
+        # The ValueOp also feeds an assign, so it has a consumer outside the mask and
+        # is not absorbed -- the general external-consumer rule still applies.
+        data = st.as_data_op(self.df)
+        thr = st.as_data_op(1)
+        ops = optimize(data[data["x"] > thr].assign(base=thr),
+                       OptConfig(dataframe_ops=True))
+        sel = self._mask(ops)
+        self.assertEqual(
+            BinOpExpr(operator.gt, Col("x"), OperandLeaf(OperandRef(1))),
+            sel.predicate)
+        self.assertEqual(2, len(sel.inputs))  # [src, thr]
+        self.assertEqual(1, len([o for o in ops if isinstance(o, ValueOp)]))
 
     def test_duplicate_masks_dedup_after_cse(self):
         # Two independently-built identical masks fold to two SelectionOps, which
@@ -300,6 +327,83 @@ class TestMaskFolding(unittest.TestCase):
         # The shared column df["x"] has an external consumer (the assign), so it
         # survives as a standalone column op -- now a ColumnProjectionOp.
         self.assertTrue(any(isinstance(o, ColumnProjectionOp) for o in ops))  # column kept
+
+
+class TestSeriesMaskFolding(unittest.TestCase):
+    """A series is as filterable as a frame: `counts[counts >= 3]` folds too."""
+
+    def setUp(self):
+        self.df = pd.DataFrame({"v": [1, 5, 3, 2], "w": [9, 8, 7, 6]})
+
+    def _mask(self, ops):
+        masks = [o for o in ops if isinstance(o, SelectionOp)
+                 and o.kind is SelectionKind.MASK]
+        self.assertEqual(1, len(masks), "expected exactly one mask SelectionOp")
+        return masks[0]
+
+    def _filtered(self):
+        data = st.as_data_op(self.df)
+        series = data["v"]
+        return optimize(series[series >= 3], OptConfig(dataframe_ops=True))
+
+    def test_a_masked_series_folds_and_stays_a_series(self):
+        sel = self._mask(self._filtered())
+        self.assertIs(OutputType.SERIES, sel.output_type)
+
+    def test_the_series_refers_to_itself_through_operand_zero(self):
+        # The predicate's subject *is* the source, which the folder spells as the
+        # operand-zero leaf rather than a named column.
+        sel = self._mask(self._filtered())
+        self.assertEqual(BinOpExpr(operator.ge, OperandLeaf(OperandRef(0)), Const(3)),
+                         sel.predicate)
+
+    def test_it_executes_like_plain_pandas(self):
+        ops = self._filtered()
+        pool_values = {}
+        for op in ops:
+            pool_values[id(op)] = op.process(
+                "fit_transform", [pool_values[id(i)] for i in op.inputs])
+        expected = self.df["v"][self.df["v"] >= 3]
+        pd.testing.assert_series_equal(pool_values[id(ops[-1])], expected)
+
+    def test_the_query_fast_path_is_frame_only(self):
+        # `DataFrame.query` has no series spelling, so a masked series must never
+        # be routed to it even with the flag on.
+        from stratum.optimizer.physical._selection_execs import _query_selectable
+        sel = self._mask(self._filtered())
+        sel.output_type = OutputType.FRAME
+        sel.predicate = BinOpExpr(operator.ge, Col("v"), Const(3))
+        self.assertTrue(_query_selectable(sel))
+        sel.output_type = OutputType.SERIES
+        self.assertFalse(_query_selectable(sel))
+
+
+class TestIsInPredicate(unittest.TestCase):
+    """`isin` folds into a selection as the column-method node (#213) for both a
+    literal collection and a graph-fed relation; only the latter is promoted."""
+
+    def setUp(self):
+        self.pdf = pd.DataFrame({"c": ["a", "b", "c", "a"]})
+
+    def _predicate(self, build):
+        ops = optimize(build(), OptConfig(dataframe_ops=True, semi_join_rewrite=False))
+        return next(o for o in ops if isinstance(o, SelectionOp)).predicate
+
+    def test_a_literal_collection_folds_into_the_predicate(self):
+        data = st.as_data_op(self.pdf)
+        predicate = self._predicate(lambda: data[data["c"].isin(["a", "c"])])
+        self.assertEqual(ColumnMethodExpr(Col("c"), "isin", (["a", "c"],)), predicate)
+
+    def test_a_relation_stays_a_leaf(self):
+        data = st.as_data_op(self.pdf)
+        other = st.as_data_op(pd.DataFrame({"c": ["a"]}))
+        predicate = self._predicate(lambda: data[data["c"].isin(other["c"])])
+        self.assertEqual(
+            ColumnMethodExpr(Col("c"), "isin", (OperandLeaf(OperandRef(1)),)), predicate)
+
+    def test_a_membership_test_is_not_an_aggregate(self):
+        self.assertFalse(
+            ColumnMethodExpr(Col("c"), "isin", (("a", "c"),)).has_aggregate())
 
 
 class TestColumnExprOperandRefs(unittest.TestCase):
@@ -363,7 +467,7 @@ class TestUnaryPredicateProcess(unittest.TestCase):
 
 
 class TestPandasQuery(unittest.TestCase):
-    """With FLAGS.pandas_query, an expressible MASK runs through DataFrame.query()."""
+    """With `pandas_query` on, an expressible MASK runs through DataFrame.query()."""
 
     def setUp(self):
         self.df = pd.DataFrame({"x": [1, 2, 3], "y": [4, 5, 6]})
@@ -408,9 +512,8 @@ class TestPandasQueryImplSelection(unittest.TestCase):
 
     def _bind(self, op):
         from stratum.optimizer.physical._impl_selection import bind_op
-        from stratum.optimizer.physical._plan_context import PlanContext
         op.inputs = [Op()]
-        return bind_op(op, PlanContext.from_flags())
+        return bind_op(op, plan_context())
 
     def test_expressible_mask_binds_query_impl_under_flag(self):
         from stratum.optimizer.physical._selection_execs import PandasQuerySelectionOp
@@ -473,11 +576,16 @@ class TestColumnExprQueryStrings(unittest.TestCase):
 class TestColumnExprMisc(unittest.TestCase):
     """Assorted ColumnExpr node behaviour."""
 
+    def test_const_key_distinguishes_scalar_types(self):
+        self.assertNotEqual(Const(1), Const(1.0))
+        self.assertNotEqual(Const(1), Const(True))
+        self.assertNotEqual(Const(1.0), Const(True))
+
     def test_const_unhashable_value_key(self):
         # An unhashable literal falls back to an identity-based key.
         value = [1, 2]
         c = Const(value)
-        self.assertEqual(("__id__", id(value)), c._key())
+        self.assertEqual((list, "__id__", id(value)), c._key())
         self.assertEqual(c, Const(value))  # same object -> equal
         hash(c)  # does not raise
 

@@ -59,6 +59,21 @@ def _read_explain_levels(value) -> tuple[str, ...]:
     return levels
 
 
+# Memory fraction of host memory to use for the buffer pool.
+_DEFAULT_BUFFER_POOL_MEMORY_FRACTION = 0.7 # default 70%
+
+def _read_memory_fraction(value) -> float:
+    try:
+        fraction = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"buffer_pool_memory_fraction must be a float in (0, 1], got {value!r}.")
+    if not 0 < fraction <= 1:
+        raise ValueError(
+            f"buffer_pool_memory_fraction must be in (0, 1], got {value!r}.")
+    return fraction
+
+
 # FIXME: Not all flags need environment variables, only the ones that are shared across backends
 @dataclass
 class _Flags:
@@ -75,16 +90,14 @@ class _Flags:
     explain: tuple[str, ...] = ()
     cse: bool = True
     DEBUG: bool = False
-    force_polars: bool = _env_bool("STRATUM_FORCE_POLARS", False)
     implementation_selector: str = _read_implementation_selector(
         os.getenv("STRATUM_IMPLEMENTATION_SELECTOR", "default"))
-    pandas_query: bool = _env_bool("STRATUM_PANDAS_QUERY", False)
     validate_dag: bool = True
     make_selection_op: bool = True
     make_map_op: bool = True
     make_column_projection: bool = True
     rechunk: bool = True
-    buffer_pool_memory_budget: int = 0
+    buffer_pool_memory_fraction: float = _DEFAULT_BUFFER_POOL_MEMORY_FRACTION
 
 FLAGS = _Flags()
 
@@ -100,15 +113,13 @@ def set_config(rust_backend: bool | None = None,
     graph_format: str = "svg",
     explain: bool | str | list[str] | None = None,
     DEBUG: bool | None = None,
-    force_polars: bool = False,
-    pandas_query: bool = False,
     cse: bool = True,
     validate_dag: bool = True,
     make_selection_op: bool = True,
     make_map_op: bool = True,
     make_column_projection: bool = True,
     rechunk: bool = True,
-    buffer_pool_memory_budget: int = 0,
+    buffer_pool_memory_fraction: float | None = None,
     implementation_selector: str = "default",
                ) -> None:
     """Runtime toggles (synced env for Rust to read).
@@ -161,22 +172,21 @@ def set_config(rust_backend: bool | None = None,
         DEBUG: bool, default false
             Enable/disable debug mode.
 
-        force_polars: bool, default false
-            Legacy frame-backend flag. It does not override the configured
-            implementation selector.
-
         implementation_selector: str, default "default"
-            Implementation-selection policy. ``"default"`` prefers pandas/
-            sklearn-skrub; ``"greedy"`` prefers efficient backends
-            (rust/polars) first.
+            Implementation-selection policy, and with it the dataframe backend:
+            ``"default"`` prefers pandas/sklearn-skrub; ``"greedy"`` prefers
+            efficient backends (rust/polars) first. This is the only user-facing
+            way to put a pipeline on polars -- the backend is a property of the
+            selector, not a flag beside it.
 
-        pandas_query: bool, default false
-            Evaluate MASK selections on the pandas backend via ``DataFrame.query()``
-            when the predicate is expressible as a query string (no OperandLeaf / str
-            accessor); otherwise fall back to boolean-mask indexing.
+        buffer_pool_memory_fraction: float in (0, 1], default 0.7
+            Share of the detected system memory used as the buffer pool's memory
+            budget. The byte budget is resolved when a BufferPool is constructed
+            (fixed 2 GiB fallback when host memory cannot be detected).
     """
     implementation_selector = _read_implementation_selector(implementation_selector)
-
+    if buffer_pool_memory_fraction is not None:
+        buffer_pool_memory_fraction = _read_memory_fraction(buffer_pool_memory_fraction)
     if rust_backend is not None:
         FLAGS.rust_backend = bool(rust_backend)
         os.environ["SKRUB_RUST"] = "1" if FLAGS.rust_backend else "0"
@@ -200,20 +210,16 @@ def set_config(rust_backend: bool | None = None,
     if DEBUG is not None:
         FLAGS.DEBUG = bool(DEBUG)
         os.environ["STRATUM_DEBUG"] = "1" if FLAGS.DEBUG else "0"
-    if force_polars is not None:
-        FLAGS.force_polars = bool(force_polars)
-        os.environ["STRATUM_FORCE_POLARS"] = "1" if FLAGS.force_polars else "0"
     FLAGS.implementation_selector = implementation_selector
     os.environ["STRATUM_IMPLEMENTATION_SELECTOR"] = implementation_selector
-    FLAGS.pandas_query = bool(pandas_query)
-    os.environ["STRATUM_PANDAS_QUERY"] = "1" if FLAGS.pandas_query else "0"
     # TODO: Select between multiple schedulers in the future.
     FLAGS.scheduler = bool(scheduler)
     FLAGS.cse = bool(cse)
     FLAGS.debug_graph = bool(debug_graph)
     FLAGS.open_graph = bool(open_graph)
     FLAGS.graph_format = str(graph_format)
-    FLAGS.buffer_pool_memory_budget = int(buffer_pool_memory_budget)
+    if buffer_pool_memory_fraction is not None:
+        FLAGS.buffer_pool_memory_fraction = buffer_pool_memory_fraction
     FLAGS.explain = _read_explain_levels(explain)
     FLAGS.make_selection_op = bool(make_selection_op)
     FLAGS.make_map_op = bool(make_map_op)
@@ -226,20 +232,38 @@ def get_config() -> dict:
     # Shallow copy for safety
     return vars(FLAGS).copy() # asdict if we want a deep copy
 
+_CONFIG_ENV_VARS = (
+    "SKRUB_RUST", "SKRUB_RUST_THREADS", "SKRUB_RUST_DEBUG_TIMING",
+    "SKRUB_RUST_ALLOW_PATCH", "STRATUM_DEBUG",
+    "STRATUM_IMPLEMENTATION_SELECTOR",
+)
+
 @contextmanager
 def config(**kwargs):
     """Temporarily override runtime config inside a context."""
     original = get_config()
-    set_config(**kwargs)
+    original_env = {name: os.environ.get(name) for name in _CONFIG_ENV_VARS}
     stratum_logger = logging.getLogger("stratum")
     prev_level = stratum_logger.level
-    if kwargs.get("DEBUG", False):
-        # set for this module stratum only
-        print("DEBUG MODE ENABLED")
-        logging.basicConfig(level=logging.INFO)
-        stratum_logger.setLevel(logging.DEBUG)
     try:
+        set_config(**kwargs)
+        if kwargs.get("DEBUG", False):
+            # set for this module stratum only
+            print("DEBUG MODE ENABLED")
+            logging.basicConfig(level=logging.INFO)
+            stratum_logger.setLevel(logging.DEBUG)
         yield
     finally:
-        set_config(**original)
+        # Restore by writing the snapshot back rather than replaying it through
+        # `set_config`: `get_config` dumps every FLAGS field, so a replay only
+        # works while the two stay in exact lockstep, and silently breaks every
+        # `with config(...)` block the moment a field is not a set_config
+        # parameter.
+        for name, value in original.items():
+            setattr(FLAGS, name, value)
+        for name, value in original_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
         stratum_logger.setLevel(prev_level)
