@@ -1,4 +1,4 @@
-"""Apply with a Choice estimator: conversion, choice unrolling, and evaluation."""
+"""Choices in Apply estimators and op arguments: conversion, choice unrolling, and evaluation."""
 from sklearn.decomposition import PCA
 from sklearn.dummy import DummyRegressor
 from sklearn.linear_model import Ridge
@@ -9,7 +9,7 @@ from skrub._utils import PassThrough
 from stratum._api import evaluate
 from stratum.optimizer._op_utils import topological_iterator
 from stratum.optimizer._optimize import choice_unrolling, convert_to_ops
-from stratum.optimizer.logical._ops import ChoiceOp, PredictorOp, TransformerOp, _iter_choices
+from stratum.optimizer.logical._ops import ChoiceOp, GetItemOp, OperandRef, PredictorOp, TransformerOp, _iter_choices
 import numpy as np
 import pandas as pd
 import stratum as st
@@ -260,6 +260,48 @@ class TestApplyParamChoice(unittest.TestCase):
 
         self.assertIsInstance(root, PredictorOp)
         self.assertIs(root.estimator, ridge)
+
+
+class TestNestedChoice(unittest.TestCase):
+    """A choice nested in an op's arguments binds to a ChoiceOp, one per choice object."""
+
+    def setUp(self):
+        self.data = st.as_data_op(pd.DataFrame({"a": [1.0, 2.0], "b": [3.0, 4.0], "y": [0.0, 1.0]}))
+
+    def test_getitem_key_binds_to_a_choice_op(self):
+        root = convert_to_ops(self.data[[st.choose_from(["a", "b"], name="col")]])
+
+        self.assertIsInstance(root, GetItemOp)
+        self.assertEqual(root.key, [OperandRef(1)])
+        choice = root.inputs[1]
+        self.assertIsInstance(choice, ChoiceOp)
+        self.assertEqual([op.value for op in choice.inputs], ["a", "b"])
+        self.assertEqual(choice.make_outcome_names(), ["col:Opt0", "col:Opt1"])
+
+    def test_choice_used_twice_is_one_choice_op(self):
+        col = st.choose_from(["a", "b"], name="col")
+        root = convert_to_ops(self.data[[col]] + self.data[[st.as_data_op(col)]])
+
+        choices = [op for op in topological_iterator(root) if isinstance(op, ChoiceOp)]
+        self.assertEqual(len(choices), 1)
+        self.assertEqual(len(choices[0].outputs), 2)
+
+    def test_choice_shared_with_an_estimator_rejected(self):
+        alpha = st.choose_from([0.1, 1.0], name="alpha")
+        pred = (self.data[["a"]] * alpha).skb.apply(Ridge(alpha=alpha), y=self.data["y"])
+        with self.assertRaises(NotImplementedError) as ctx:
+            convert_to_ops(pred)
+        self.assertIn("more than one operator", str(ctx.exception))
+
+    def test_unsupported_nested_choices_rejected(self):
+        a = self.data[["a"]]
+        choice = st.choose_from(["a", "b"], name="c")
+        for dag in (a * st.choose_float(0.1, 1.0, name="f"),
+                    self.data[[choice.match({"a": "a", "b": "b"})]],
+                    a.skb.apply_func(lambda df, m: df, Ridge(alpha=st.choose_from([0.1, 1.0]))),
+                    st.deferred(st.choose_from([abs, round]))(a)):
+            with self.subTest(dag=dag), self.assertRaises(NotImplementedError):
+                convert_to_ops(dag)
 
 
 if __name__ == "__main__":

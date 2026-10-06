@@ -320,6 +320,8 @@ def convert_to_ops(dag: DataOp, env: dict = None) -> Op:
     # id(DataOp) -> Op. Keyed by DataOp identity (not the graph's node keys) so
     # as_op's operand binder can resolve inputs found in the impl fields directly.
     ids_to_ops = {}
+    # id(choice) -> ChoiceOp: one op per choice object, shared by all its uses.
+    choice_ops = {}
     for node_key in order:
         skrub_op = nodes[node_key]
         impl = skrub_op._skrub_impl
@@ -331,7 +333,8 @@ def convert_to_ops(dag: DataOp, env: dict = None) -> Op:
             ids_to_ops[id(skrub_op)] = ids_to_ops[id(nodes[input_key])]
             continue
         ids_to_ops[id(skrub_op)] = as_op(skrub_op, ids_to_ops, env,
-                                         feeds_estimator=node_key in feeds_estimator)
+                                         feeds_estimator=node_key in feeds_estimator,
+                                         choice_ops=choice_ops)
 
     root = ids_to_ops[id(nodes[root_id])]
     log_time("conversion took", start)

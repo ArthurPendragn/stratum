@@ -145,8 +145,8 @@ def topological_iterator_dfs(queue, indegree) -> Iterator[Op]:
                 stack.append(out_op)
 
 def _iter_operand_refs(value):
-    """Yield every OperandRef nested in value (recurses lists/tuples/dicts, and
-    column-expression trees that expose ``iter_operand_refs``)."""
+    """Yield every OperandRef nested in value (recurses lists/tuples/dicts/slices,
+    and column-expression trees that expose ``iter_operand_refs``)."""
     if isinstance(value, OperandRef):
         yield value
     elif isinstance(value, (list, tuple)):
@@ -155,6 +155,9 @@ def _iter_operand_refs(value):
     elif isinstance(value, dict):
         for v in value.values():
             yield from _iter_operand_refs(v)
+    elif isinstance(value, slice):
+        for bound in (value.start, value.stop, value.step):
+            yield from _iter_operand_refs(bound)
     elif hasattr(value, "iter_operand_refs"):
         yield from value.iter_operand_refs()
 

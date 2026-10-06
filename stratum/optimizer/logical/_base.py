@@ -96,6 +96,8 @@ def _resolve_operand(value, inputs):
         return [_resolve_operand(v, inputs) for v in value]
     if isinstance(value, dict):
         return {k: _resolve_operand(v, inputs) for k, v in value.items()}
+    if isinstance(value, slice):
+        return slice(*(_resolve_operand(b, inputs) for b in (value.start, value.stop, value.step)))
     return value
 
 
@@ -113,7 +115,7 @@ def remap_operand_refs(value, mapping: dict):
     """Return ``value`` with every nested :class:`OperandRef` remapped through
     ``mapping`` (old input index -> new input index).
 
-    Recurses tuples/lists/dicts and column-expression trees (anything exposing a
+    Recurses tuples/lists/dicts/slices and column-expression trees (anything exposing a
     ``remap_operand_refs`` method, e.g. a ``ColumnExpr`` predicate). This is the
     single walker shared by CSE edge de-duplication (``_op_cse``) and
     :meth:`IRNode._dedupe_input_refs`, so both renumber refs identically --
@@ -127,6 +129,9 @@ def remap_operand_refs(value, mapping: dict):
         return [remap_operand_refs(v, mapping) for v in value]
     if isinstance(value, dict):
         return {k: remap_operand_refs(v, mapping) for k, v in value.items()}
+    if isinstance(value, slice):
+        return slice(*(remap_operand_refs(b, mapping)
+                       for b in (value.start, value.stop, value.step)))
     if hasattr(value, "remap_operand_refs"):
         return value.remap_operand_refs(mapping)
     return value

@@ -52,10 +52,16 @@ class OperandBinder:
     canonical operand order (e.g. the implicit primary object is bound first, so
     it becomes ``OperandRef(0)``). Repeated DataOps map to the same index, so the
     same upstream op feeding two slots produces a single input edge.
+
+    With ``choice_ops`` (``id(choice) -> ChoiceOp``, shared by the whole
+    conversion), a skrub choice found in a field is bound like a DataOp: to the
+    ChoiceOp built for that choice object (see :func:`_choice_op`). Without it,
+    choices are left in place as plain values.
     """
 
-    def __init__(self, ids_to_ops: dict):
+    def __init__(self, ids_to_ops: dict, choice_ops: dict | None = None):
         self.ids_to_ops = ids_to_ops
+        self.choice_ops = choice_ops
         self.inputs: list = []
         self._index: dict = {}  # id(Op) -> position in self.inputs
 
@@ -81,12 +87,21 @@ class OperandBinder:
         """
         if isinstance(value, DataOp):
             return self.ref(value)
+        if self.choice_ops is not None:
+            if isinstance(value, (BaseChoice, Match)):
+                return self.ref_op(_choice_op(value, self.ids_to_ops, self.choice_ops))
+            if isinstance(value, BaseEstimator) and _contains_choice(value):
+                raise NotImplementedError(
+                    f"A choice inside the parameters of {type(value).__name__} is only "
+                    "supported in the estimator of `.skb.apply()`.")
         if isinstance(value, tuple):
             return tuple(self.bind(v) for v in value)
         if isinstance(value, list):
             return [self.bind(v) for v in value]
         if isinstance(value, dict):
             return {k: self.bind(v) for k, v in value.items()}
+        if isinstance(value, slice):
+            return slice(self.bind(value.start), self.bind(value.stop), self.bind(value.step))
         return value
 
     def bind_seq(self, seq):
@@ -801,7 +816,8 @@ def _iter_nested(value):
             yield from _iter_nested(v)
 
 
-def _apply_estimator_op(impl: Apply, estimator, ids_to_ops: dict, feeds_estimator: bool = False) -> Op:
+def _apply_estimator_op(impl: Apply, estimator, ids_to_ops: dict, feeds_estimator: bool = False,
+                        choice_ops: dict | None = None) -> Op:
     """Build the TransformerOp/EstimatorOp for one concrete estimator of an Apply impl.
 
     ``estimator`` is ``impl.estimator`` itself, or one outcome of it when the
@@ -812,6 +828,9 @@ def _apply_estimator_op(impl: Apply, estimator, ids_to_ops: dict, feeds_estimato
     fit_transforms and transforms any estimator that can, a predictor included (a
     KMeans feeds on its distances, not its labels), so such an estimator becomes a
     TransformerOp here.
+
+    ``choice_ops`` is :func:`as_op`'s: a choice in the Apply's other fields (``y``,
+    ``cols``, ...) binds to the one ChoiceOp built for it.
     """
     if estimator is None or (isinstance(estimator, str) and estimator == "passthrough"):
         # Same normalization skrub's _wrap_estimator applies at fit time; needed
@@ -821,7 +840,7 @@ def _apply_estimator_op(impl: Apply, estimator, ids_to_ops: dict, feeds_estimato
         estimator_class = PredictorOp
     else:
         estimator_class = TransformerOp
-    binder = OperandBinder(ids_to_ops)
+    binder = OperandBinder(ids_to_ops, choice_ops)
     binder.ref(impl.X)  # OperandRef(0)
     param_refs = {k: binder.ref(v) for k, v in estimator.get_params().items()
                   if isinstance(v, DataOp) and id(v) in ids_to_ops}
@@ -880,6 +899,9 @@ def _iter_choices(value):
     elif type(value) in _CHOICE_CONTAINERS:
         for v in value:
             yield from _iter_choices(v)
+    elif type(value) is slice:
+        for bound in (value.start, value.stop, value.step):
+            yield from _iter_choices(bound)
 
 
 def _contains_choice(value) -> bool:
@@ -990,35 +1012,101 @@ def _expand_estimator_choices(estimator) -> list[tuple[list, object]]:
 
 
 def check_choices_not_shared(data_ops) -> None:
-    """Refuse a choice object that more than one operator depends on.
+    """Refuse a choice object used both in an Apply's estimator and anywhere else.
 
     skrub keys a choice by identity, so one ``choose_from`` used in two places is a
-    single grid dimension: both uses always take the same outcome. Conversion expands
-    the choices of each Apply on its own, which would search the uses independently,
-    a different grid, so this is refused rather than silently diverging from skrub.
+    single grid dimension: both uses always take the same outcome. Conversion gives
+    every choice outside an Apply's estimator one ChoiceOp, shared by all its uses
+    (see :func:`_choice_op`), so those keep skrub's grid. The choices of an Apply's
+    estimator are instead expanded with that Apply alone, which would search a use
+    elsewhere independently, a different grid, so this is refused rather than
+    silently diverging from skrub.
     """
-    owners = {}
+    owners = {}  # id(choice) -> (owner key, DataOp first found using it)
     for data_op in data_ops:
         impl = data_op._skrub_impl
-        if isinstance(impl, Apply):
-            found = [c for c in _iter_choices(impl.estimator) if isinstance(c, BaseChoice)]
-        elif isinstance(impl, Value) and isinstance(impl.value, Choice):
-            found = [impl.value]
-        else:
-            continue
-        for choice in {id(c): c for c in found}.values():
-            owner = owners.setdefault(id(choice), data_op)
-            if owner is not data_op:
-                raise NotImplementedError(
-                    f"The choice {choice!r} is used by more than one operator "
-                    f"({owner.__skrub_short_repr__()} and "
-                    f"{data_op.__skrub_short_repr__()}). skrub searches it as one "
-                    "parameter, so every use takes the same outcome; stratum does not "
-                    "support that yet.")
+        uses = []
+        for field_name in impl._fields:
+            value = getattr(impl, field_name)
+            if isinstance(impl, Apply) and field_name == "estimator":
+                uses.append((id(data_op), value))
+            else:
+                uses.append(("shared", value))
+        for owner_key, value in uses:
+            found = [c for c in _iter_choices(value) if isinstance(c, BaseChoice)]
+            for choice in {id(c): c for c in found}.values():
+                owner, first_user = owners.setdefault(id(choice), (owner_key, data_op))
+                if owner != owner_key:
+                    raise NotImplementedError(
+                        f"The choice {choice!r} is used by more than one operator "
+                        f"({first_user.__skrub_short_repr__()} and "
+                        f"{data_op.__skrub_short_repr__()}), at least one of them as "
+                        "the estimator of `.skb.apply()`. skrub searches it as one "
+                        "parameter, so every use takes the same outcome; stratum does "
+                        "not support that yet.")
+
+
+def _choice_op(choice, ids_to_ops: dict, choice_ops: dict) -> "ChoiceOp":
+    """The ChoiceOp of a choice used outside an Apply's estimator, built once per choice.
+
+    skrub keys a choice by identity, so all uses of one choice object -- a
+    ``Value(Choice)`` node, or a choice nested in another op's arguments such as the
+    key of ``X[[choose_from(...)]]`` -- share this one op, and choice unrolling then
+    searches it as one grid dimension. ``choice_ops`` maps ``id(choice)`` to the
+    ops built so far; the outcome ops get their output edge to the ChoiceOp here.
+    """
+    op = choice_ops.get(id(choice))
+    if op is not None:
+        return op
+    if isinstance(choice, Match):
+        raise NotImplementedError(
+            f"`.match()` on a choice is only supported in the estimator of "
+            f"`.skb.apply()` (it matches choice {choice.choice.name!r}).")
+    if isinstance(choice, Choice):
+        outcomes, names = choice.outcomes, choice.outcome_names
+    elif isinstance(choice, DiscretizedNumericChoice):
+        outcomes = list(choice.grid)
+        names = [_outcome_label(v, i, False) for i, v in enumerate(outcomes)]
+    else:
+        raise NotImplementedError(
+            f"{choice!r} is a continuous range, which a grid search cannot enumerate. "
+            "Pass `n_steps` to search a grid of values from it.")
+    # Outcomes are consumed positionally by ChoiceOp.process: one input per outcome.
+    inputs = [_outcome_op(o, ids_to_ops, choice_ops) for o in outcomes]
+    op = ChoiceOp(names, len(outcomes), choice.name)
+    op.inputs = inputs
+    for in_op in inputs:
+        in_op.add_output(op)
+    choice_ops[id(choice)] = op
+    return op
+
+
+def _outcome_op(outcome, ids_to_ops: dict, choice_ops: dict) -> Op:
+    """The op producing one outcome of a choice (see :func:`_choice_op`)."""
+    if isinstance(outcome, DataOp):
+        return ids_to_ops[id(outcome)]
+    if isinstance(outcome, (BaseChoice, Match)):
+        return _choice_op(outcome, ids_to_ops, choice_ops)
+    binder = OperandBinder(ids_to_ops, choice_ops)
+    value = binder.bind(outcome)
+    if not binder.inputs:
+        return ValueOp(outcome)
+    # A container holding DataOps or choices (``choose_from([["a", other], ...])``)
+    # is assembled at runtime from the values they produce.
+    op = CallOp(name=type(outcome).__name__, func=_identity, args=(value,), kwargs={})
+    op.inputs = binder.inputs
+    for in_op in op.inputs:
+        in_op.add_output(op)
+    return op
+
+
+def _identity(value):
+    return value
 
 
 # TODO: Move this to frontend package
-def as_op(data_op: DataOp, ids_to_ops: dict, env: dict | None = None, feeds_estimator: bool = False) -> Op:
+def as_op(data_op: DataOp, ids_to_ops: dict, env: dict | None = None, feeds_estimator: bool = False,
+          choice_ops: dict | None = None) -> Op:
     """Convert a single skrub DataOp into an Op, building its de-duplicated
     ``inputs`` list and operand references in one canonical field walk.
 
@@ -1033,31 +1121,34 @@ def as_op(data_op: DataOp, ids_to_ops: dict, env: dict | None = None, feeds_esti
 
     ``feeds_estimator`` says another Apply consumes ``data_op``'s value (see
     ``_apply_estimator_op``).
+
+    ``choice_ops`` maps ``id(choice) -> ChoiceOp`` across one conversion, so that
+    every use of a choice outside an Apply's estimator -- a ``Value(Choice)`` node
+    or a choice nested in an op's arguments -- binds to one shared ChoiceOp (see
+    :func:`_choice_op`). Left ``None``, the choices of this op get fresh ones.
     """
+    if choice_ops is None:
+        choice_ops = {}
     impl = data_op._skrub_impl
     is_X = is_y = False
     if impl is not None:
         is_X = impl.is_X
         is_y = impl.is_y
-    binder = OperandBinder(ids_to_ops)
+    binder = OperandBinder(ids_to_ops, choice_ops)
     return_op = None
 
     if isinstance(impl, Value):
-        if isinstance(impl.value, Choice):
-            choice = impl.value
-            # Choice outcomes are consumed positionally by ChoiceOp.process; keep one
-            # input entry per outcome (constants become fresh ValueOps).
-            inputs = [ids_to_ops[id(o)] if isinstance(o, DataOp) else ValueOp(o)
-                      for o in choice.outcomes]
-            return_op = ChoiceOp(choice.outcome_names, len(choice.outcomes), choice.name)
-            return_op.inputs = inputs
-        else:
-            return_op = ValueOp(impl.value)
+        # A choice (or a container holding one) becomes the choice's shared ChoiceOp,
+        # anything else a ValueOp.
+        return_op = _outcome_op(impl.value, ids_to_ops, choice_ops)
     elif isinstance(impl, CallMethod):
         binder.ref(impl.obj)  # implicit primary operand -> OperandRef(0)
         return_op = MethodCallOp(impl.method_name, binder.bind_seq(impl.args), binder.bind_map(impl.kwargs))
         return_op.inputs = binder.inputs
     elif isinstance(impl, Call):
+        if _contains_choice(impl.func):
+            raise NotImplementedError(
+                f"Calling a choice of functions is not supported yet ({impl.func!r}).")
         return_op = CallOp(
             name=impl.get_func_name(),
             func=impl.func,
@@ -1094,7 +1185,7 @@ def as_op(data_op: DataOp, ids_to_ops: dict, env: dict | None = None, feeds_esti
             # correctly if choice_unrolling later combines this choice with a
             # downstream one.
             leaves = _expand_estimator_choices(impl.estimator)
-            outcome_ops = [_apply_estimator_op(impl, est, ids_to_ops, feeds_estimator)
+            outcome_ops = [_apply_estimator_op(impl, est, ids_to_ops, feeds_estimator, choice_ops)
                            for _, est in leaves]
             for est_op in outcome_ops:
                 # The trailing edge-wiring below only covers the returned op.
@@ -1103,7 +1194,8 @@ def as_op(data_op: DataOp, ids_to_ops: dict, env: dict | None = None, feeds_esti
             return_op = ChoiceOp(outcome_names=[path for path, _ in leaves],
                                  append_choice_name=False, inputs=outcome_ops)
         else:
-            return_op = _apply_estimator_op(impl, impl.estimator, ids_to_ops, feeds_estimator)
+            return_op = _apply_estimator_op(impl, impl.estimator, ids_to_ops, feeds_estimator,
+                                            choice_ops)
     elif isinstance(impl, SplitX):
         for field_name in impl._fields:
             for child in _collect_child_data_ops(getattr(impl, field_name)):
