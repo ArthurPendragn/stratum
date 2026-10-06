@@ -341,6 +341,16 @@ class NestedChoiceSearchTest(unittest.TestCase):
         scaled = X.skb.apply(StandardScaler(), cols=st.choose_from([["a"], ["b"]], name="cols"))
         self._assert_matches_skrub(scaled.skb.apply(LogisticRegression(), y=y), 2)
 
+    def test_apply_cols_choice_nested_in_a_list(self):
+        for fixed_cols in ([], ["c"]):
+            with self.subTest(fixed_cols=fixed_cols):
+                X, y = self._X_y()
+                cols = [*fixed_cols, st.choose_from(["a", "b"], name="col")]
+                scaled = X.skb.apply(StandardScaler(), cols=cols)
+                results = self._assert_matches_skrub(
+                    scaled.skb.apply(LogisticRegression(), y=y), 2)
+                self.assertEqual(set(results["id"].to_list()), {"col:Opt0", "col:Opt1"})
+
     def test_discretized_numeric_choice_in_a_slice(self):
         X, y = self._X_y()
         pred = X.iloc[:, :st.choose_int(1, 3, n_steps=3, name="n")]

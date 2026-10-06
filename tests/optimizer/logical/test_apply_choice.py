@@ -5,6 +5,7 @@ from sklearn.linear_model import Ridge
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MinMaxScaler, RobustScaler, StandardScaler
+from skrub import ApplyToCols
 from skrub._utils import PassThrough
 from stratum._api import evaluate
 from stratum.optimizer._op_utils import topological_iterator
@@ -142,6 +143,18 @@ class TestApplyChoice(unittest.TestCase):
                                    StandardScaler().fit_transform(numeric))
         np.testing.assert_allclose(by_id["scaler:MinMaxScaler"].to_numpy(),
                                    MinMaxScaler().fit_transform(numeric))
+
+    def test_evaluate_choice_nested_in_cols(self):
+        frame = self.df[["a", "b", "s"]]
+        src = st.as_data_op(frame)
+        out = evaluate(src.skb.apply(
+            StandardScaler(), cols=[st.choose_from(["a", "b"], name="col")]))
+
+        by_id = {o["id"]: o["vals"] for o in out}
+        self.assertEqual(set(by_id), {"col:Opt0", "col:Opt1"})
+        for i, col in enumerate(("a", "b")):
+            expected = ApplyToCols(StandardScaler(), cols=[col]).fit_transform(frame)
+            pd.testing.assert_frame_equal(by_id[f"col:Opt{i}"], expected)
 
     def test_evaluate_optional(self):
         src = st.as_data_op(self.df[["a", "b"]])

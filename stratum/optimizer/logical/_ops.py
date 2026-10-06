@@ -385,7 +385,7 @@ class BaseEstimatorOp(Op):
         # ``set_params`` call at that point (even an empty one).
         if fitting and place_holders:
             estm.set_params(**place_holders)
-        cols = inputs[self.cols.k] if isinstance(self.cols, OperandRef) else self.cols
+        cols = _resolve_operand(self.cols, inputs)
         exclude_cols = _resolve_operand(self.exclude_cols, inputs)
         no_wrap = _resolve_operand(self.no_wrap, inputs)
         # A response pass never fits, so (like skrub) the fit group is left unevaluated.
