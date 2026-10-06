@@ -21,19 +21,6 @@ def replace_op_in_outputs(op: Op, replacement: Op):
         replacement.add_output(out_)
 
 
-def find_choice_naive(op: Op) -> tuple[ChoiceOp, bool]:
-    """
-    Find the choice operation in the sub-dag using a naive approach. Might return incorrect results if there are multiple choices in the sub-dag.
-    """
-    # TODO check and improve find_choice(op: Op)
-    last_op = op
-    contains_choice = False
-    while len(last_op.outputs) > 0 and not contains_choice:
-        last_op = last_op.outputs[0]
-        contains_choice = last_op.is_choice()
-    return last_op, contains_choice
-
-
 def get_all_outputs(op: Op, stop_at_op: Op = None):
     """Returns a list of all output ops. If stop_at_op is given, the outputs of the stop_at_op are not included."""
     queue = [op]

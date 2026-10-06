@@ -238,6 +238,48 @@ class ChoiceSearchTest(unittest.TestCase):
                                                       name="scaler"))
         self._assert_matches_skrub(pred, 4)
 
+    def _assert_ids_match_skrub(self, pred, labels):
+        """Each candidate's score is the one skrub reports for the same grid point.
+
+        ``labels`` maps each choice name to stratum's label of every skrub outcome.
+        """
+        results = self._assert_matches_skrub(pred, 4)
+        expected = pred.skb.make_grid_search(fitted=True, refit=False,
+                                             scoring="accuracy").results_
+        expected_by_id = {
+            ", ".join(f"{name}:{labels[name].get(row[name], row[name])}" for name in labels):
+                row["mean_test_score"]
+            for _, row in expected.iterrows()}
+        ours_by_id = dict(zip(results["id"].to_list(), results["scores"].to_list()))
+        self.assertEqual(ours_by_id.keys(), expected_by_id.keys())
+        for candidate, score in expected_by_id.items():
+            self.assertAlmostEqual(ours_by_id[candidate], score, msg=candidate)
+
+    def test_independent_choices_join_after_the_predictor(self):
+        # Unrolling stopped after the `C` choice, so the `wcol` choice on the other
+        # branch reached the runtime as the GetItem key.
+        data = st.var("data", self.df)
+        y = data["t"].skb.mark_as_y()
+        X = data.drop(columns="t").skb.mark_as_X(cv=KFold(3), split_kwargs={})
+        pred = X.skb.apply(LogisticRegression(C=st.choose_from([0.01, 1.0], name="C")), y=y)
+        key = st.as_data_op(st.choose_from(["a", "b"], name="wcol"))
+        joined = pred.skb.apply_func(lambda p, w: p, X[key].abs())
+        self._assert_ids_match_skrub(
+            joined, {"C": {}, "wcol": {"a": "Opt0", "b": "Opt1"}})
+
+    def test_independent_choices_join_before_the_predictor(self):
+        # Every grid point scores differently, so a candidate named after another shows.
+        data = st.var("data", self.df)
+        y = data["t"].skb.mark_as_y()
+        X = data.drop(columns="t").skb.mark_as_X(cv=KFold(3), split_kwargs={})
+        first = st.as_data_op(st.choose_from(["a", "b"], name="first"))
+        second = st.as_data_op(st.choose_from(["c", "a"], name="second"))
+        feature = X[first].skb.apply_func(lambda u, v: (u + 0.5 * v).to_frame("f"),
+                                          X[second])
+        self._assert_ids_match_skrub(
+            feature.skb.apply(LogisticRegression(), y=y),
+            {"first": {"a": "Opt0", "b": "Opt1"}, "second": {"c": "Opt0", "a": "Opt1"}})
+
     def test_estimator_choice_refusing_set_params_once_fitted(self):
         # #224: the second grid point must not reconfigure an already fitted model.
         model = st.choose_from({"weak": RefusesRefitParams(C=0.01),

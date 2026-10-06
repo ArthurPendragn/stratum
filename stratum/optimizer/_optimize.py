@@ -11,7 +11,7 @@ from .logical._numeric_ops import extract_numeric_op
 from .logical._candidate_ops import CollectCandidatesOp, DeclaredScoringOp, ScoreCandidatesOp
 from .logical._ops import BaseEstimatorOp, ChoiceOp, Op, OperandRef, as_op, check_choices_not_shared, remap_operand_refs
 from .logical._split_ops import SplitOutput
-from ._op_utils import clone_sub_dag, find_choice_naive, replace_op_in_outputs, show_graph, topological_iterator, validate_dag
+from ._op_utils import show_graph, topological_iterator, validate_dag
 from ._explain import explain_linear_plan
 from .logical._algebraic_rewrites import algebraic_rewrites, AlgebraicRewritesConfig
 from .logical._relational_rewrites import relational_rewrites
@@ -533,74 +533,85 @@ def get_dataops_graph(dag: DataOp) -> tuple[dict, dict, dict]:
 
 
 def choice_unrolling(root: Op):
-    """ Rewrite for unrolling the dag after choice op into separate dags for each outcome."""
+    """Unroll the choices into one candidate sub-dag per grid point.
+
+    The result ends in a single ChoiceOp whose inputs are the candidates: the root if
+    it is a choice already, otherwise one appended over the root. Choices are unrolled
+    downstream-first, so the region a choice copies never holds another choice, and
+    choices on different branches multiply into their Cartesian product. A candidate a
+    choice does not reach is kept as is: as in skrub's grid, a choice nested in one
+    outcome of another only varies when that outcome is taken.
+    """
     start = start_time()
-    contains_choice = True
-    while contains_choice:
-        dag_iter = topological_iterator(root)
-        contains_choice = False
-        for op in dag_iter:
-            if op.is_choice():
-                outcomes = op.inputs
-
-                # check if we find any choice in the sub-dag of the current choice
-                last_op, is_choice = find_choice_naive(op)
-                if last_op is op:
-                    # the choice has no consumers left: unrolling is finished
-                    contains_choice = False
-                    break
-                if is_choice:
-                    unroll_nested_choice(last_op, op, outcomes)
-                    contains_choice = True
-                else:
-                    assert root is last_op, "Root should be the last op in the dag"
-                    # we reached the end of the dag
-                    logger.debug(f"Unrolling simple choice: {op}")
-                    root = unroll_simple_choice(root, op, outcomes)
-                    logger.debug(f"New root after unrolling: {root}")
-
-                del op
-                break
+    choices = [op for op in topological_iterator(root) if op.is_choice() and op is not root]
+    if choices:
+        if root.is_choice():
+            sink = root
+        else:
+            sink = ChoiceOp(outcome_names=[[]], append_choice_name=False, inputs=[root])
+            root.add_output(sink)
+        for choice in reversed(choices):
+            logger.debug(f"Unrolling choice: {choice}")
+            unroll_choice(choice, sink)
+        sink.update_name()
+        root = sink
     log_time("unrolled took", start)
     _debug_show_graph(root, "unrolled")
     return root
 
 
+def unroll_choice(choice: ChoiceOp, sink: ChoiceOp):
+    """Replace ``choice`` by one copy of the region downstream of it per outcome.
 
-def unroll_simple_choice(root: Op, op: ChoiceOp, outcomes: list) -> Op:
-    """ Unroll a simple choice op, which has no choice in the sub-dag."""
-    dag_root = ChoiceOp(outcome_names=op.outcome_names, append_choice_name=False)
-    dag_root.inputs = [root]
+    The region (every op between ``choice`` and ``sink``) must hold no other choice.
+    The first outcome reuses the region, the others get clones. Each candidate of
+    ``sink`` the region reaches becomes one candidate per outcome, named with the
+    outcome's name in front of its own; the other candidates are kept as they are.
+    """
+    region, reached = [], {choice}
+    for op in topological_iterator(sink):
+        if op is not sink and any(in_ in reached for in_ in op.inputs):
+            assert not op.is_choice(), "choices must be unrolled downstream-first"
+            reached.add(op)
+            region.append(op)
 
-    # clones sub-dag after choice op for all outcomes[1:]
-    for outcome in outcomes[1:]:
-        outcome.outputs = []
-        leafs = clone_sub_dag(op, new_root_op=outcome)
-        assert len(leafs) == 1
-        dag_root.add_input(leafs[0])
-        leafs[0].add_output(dag_root)
+    outcomes = list(choice.inputs)
+    copies = [{choice: outcome} for outcome in outcomes]
+    # Clone before the region is rewired below, so clones still see the choice.
+    for k in range(1, len(outcomes)):
+        copy = copies[k]
+        for op in region:
+            clone = op.clone()
+            clone.inputs = [in_ if in_ is choice else copy.get(in_, in_) for in_ in op.inputs]
+            _replace_choice_input(clone, choice, outcomes[k])
+            for in_ in dict.fromkeys(clone.inputs):
+                in_.add_output(clone)
+            copy[op] = clone
+    for op in region:
+        copies[0][op] = op
+        if _replace_choice_input(op, choice, outcomes[0]):
+            outcomes[0].add_output(op)
+    choice.detach()
 
-    # reuse sub-dag for the first outcome
-    outcomes[0].outputs = []
-    replace_op_in_outputs(op, replacement=outcomes[0])
-    root.add_output(dag_root)
-    return dag_root
+    names, candidates = [], []
+    for copy, outcome_name in zip(copies, choice.outcome_names):
+        for name, candidate in zip(sink.outcome_names, sink.inputs):
+            if candidate in copy:
+                names.append(outcome_name + name)
+                candidates.append(copy[candidate])
+            elif copy is copies[0]:
+                names.append(name)
+                candidates.append(candidate)
+    sink.outcome_names = names
+    sink.inputs = candidates
+    for candidate in candidates:
+        candidate.add_output(sink)
 
 
-def unroll_nested_choice(last_op: ChoiceOp, op: ChoiceOp, outcomes):
-    """ Unroll a nested choice op, which has choice in the sub-dag."""
-    n_outcomes = len(last_op.outcome_names)
-
-    # clone the sub-dag for each outcome of the current choice
-    for outcome, outcome_name in zip(outcomes[1:], op.outcome_names[1:]):
-        outcome.outputs = []
-        clone_sub_dag(op, new_root_op=outcome, stop_at_op=last_op)
-        for i in range(n_outcomes):
-            last_op.outcome_names.append(last_op.outcome_names[i] + outcome_name)
-
-    # reuse sub-dag for the first outcome
-    outcomes[0].outputs = [op.outputs[0]]
-    for i in range(n_outcomes):
-        last_op.outcome_names[i] += op.outcome_names[0]
-    outcomes[0].outputs = []
-    replace_op_in_outputs(op, replacement=outcomes[0])
+def _replace_choice_input(op: Op, choice: ChoiceOp, outcome: Op) -> bool:
+    """Replace every input edge of ``op`` from ``choice`` by one from ``outcome``."""
+    replaced = False
+    while any(in_ is choice for in_ in op.inputs):
+        op.replace_input(choice, outcome)
+        replaced = True
+    return replaced
