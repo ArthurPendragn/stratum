@@ -10,6 +10,7 @@ from .logical._dataframe_ops import extract_dataframe_op, add_splitting_op
 from .logical._numeric_ops import extract_numeric_op
 from .logical._candidate_ops import CollectCandidatesOp, DeclaredScoringOp, ScoreCandidatesOp
 from .logical._ops import BaseEstimatorOp, ChoiceOp, Op, OperandRef, as_op, check_choices_not_shared, remap_operand_refs
+from .logical._voting import VotingOp, expand_voting_classifiers
 from .logical._split_ops import SplitOutput
 from ._op_utils import show_graph, topological_iterator, validate_dag
 from ._explain import explain_linear_plan
@@ -220,6 +221,15 @@ def logical_optimize(dag_root: DataOp, config: OptConfig, env: dict = None,
     # a promoted join reads is already shared with whatever else produced it.
     root = relational_rewrites(root, semi_join=config.semi_join_rewrite)
     _debug_show_graph(root, "relational_rewrite")
+
+    # After choices are concrete estimators, so each candidate's voter expands
+    # on its own. Before the candidate set, so scoring sees the vote's
+    # responses rather than a member's. CSE runs again only when a voter was
+    # expanded: that is when identical members become separate nodes that can
+    # be shared. Plans with no voter keep the shape the earlier CSE left.
+    root, expanded_vote = expand_voting_classifiers(root)
+    if expanded_vote and FLAGS.cse:
+        root = run_op_cse_pass(root)
 
     # Last, so every rewrite above sees the plan shape it was written against. A plan
     # whose choices were not unrolled is not an executable candidate set, so it gets no
@@ -495,11 +505,13 @@ def _response_mode(metric, names: list[str], candidates: list[Op]) -> str:
     )
 
 
-def _last_estimator(op: Op) -> BaseEstimatorOp | None:
+def _last_estimator(op: Op) -> BaseEstimatorOp | VotingOp | None:
     """The estimator nearest the end of a candidate's path, or None if it has none.
 
     The candidate's own tail may be post-processing; what decides which responses the
     plan can produce is the estimator feeding it, as it is the final `Apply` in skrub.
+    A vote is that estimator even though it is not itself a fitted model: its members
+    can serve responses the vote refuses.
     """
     seen, queue = set(), [op]
     while queue:
@@ -507,7 +519,10 @@ def _last_estimator(op: Op) -> BaseEstimatorOp | None:
         if id(node) in seen:
             continue
         seen.add(id(node))
-        if isinstance(node, BaseEstimatorOp):
+        # A vote is the response the plan produces. Its members also look like
+        # estimators, and a hard vote's members may implement predict_proba
+        # even though the vote does not.
+        if isinstance(node, (BaseEstimatorOp, VotingOp)):
             return node
         queue.extend(node.inputs)
     return None

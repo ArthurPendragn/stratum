@@ -36,9 +36,11 @@ def mark_fit_dead_ops(linearized_dag: list[Op], split_pos: int | None,
 
     protected = set(flagged_ops)
     for op in reversed(linearized_dag[split_pos:]):
-        if isinstance(op, BaseEstimatorOp):
-            # Fitting is the whole point of the pass for these, transformers included:
-            # a step after the predictor still has to be fitted on its output.
+        if isinstance(op, BaseEstimatorOp) or getattr(op, "records_training_labels", False):
+            # Fitting is the whole point of the pass for an estimator, transformers
+            # included: a step after the predictor still has to be fitted on its
+            # output. A vote copies its encoder's class order on this same pass, so
+            # skipping it would leave the response pass without one.
             continue
         if op in protected:
             # Re-executed ops are scheduled outside the plan's own order, so their

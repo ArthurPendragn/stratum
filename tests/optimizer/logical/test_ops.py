@@ -210,11 +210,17 @@ class TestUtilFunctions(unittest.TestCase):
 
     def test_process_estimator_bad_mode(self):
         with self.assertRaises(ValueError):
-            process_estimator_task((StandardScaler(), pd.DataFrame({"a": [1]}), None, None, "no-wrap", False, False, {}, "bad", None))
+            process_estimator_task((
+                StandardScaler(), pd.DataFrame({"a": [1]}), None, None, "no-wrap",
+                False, False, ({}, {}), "bad", None, "predict",
+            ))
 
     def test_process_transformer_bad_mode(self):
         with self.assertRaises(ValueError):
-            process_transformer_task((StandardScaler(), pd.DataFrame({"a": [1]}), None, None, "no-wrap", False, False, {}, "bad", None))
+            process_transformer_task((
+                StandardScaler(), pd.DataFrame({"a": [1]}), None, None, "no-wrap",
+                False, False, ({}, {}), "bad", None, "predict",
+            ))
 
 
 class TestOpProcess(unittest.TestCase):

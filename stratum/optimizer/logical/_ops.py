@@ -265,7 +265,7 @@ RESPONSE_MODES = frozenset({"predict", "predict_proba", "predict_log_proba",
 
 class BaseEstimatorOp(Op):
     fields = ["estimator", "y", "cols", "exclude_cols", "no_wrap", "allow_reject", "unsupervised", "kwargs", "param_refs",
-              "feeds_estimator"]
+              "feeds_estimator", "response_override"]
     # skrub keys `Apply.kwargs` by the estimator method the kwargs belong to, and
     # evaluates only the group for the method it is about to call. Subclasses name
     # the two groups stratum can reach: the one for the fitting call and the one
@@ -288,7 +288,7 @@ class BaseEstimatorOp(Op):
             m for m in cls.response_modes if hasattr(estimator, m)}
 
     def __init__(self, estimator: BaseEstimator, y=None, cols=None, exclude_cols=None, no_wrap=False, allow_reject=False, unsupervised=False, kwargs=None, param_refs=None,
-                 feeds_estimator=False):
+                 feeds_estimator=False, response_override=None):
         super().__init__()
         if kwargs is None:
             kwargs = {}
@@ -313,6 +313,10 @@ class BaseEstimatorOp(Op):
         # Whether another `.skb.apply()` consumes this op's output. Such an op is not
         # the last estimator, so like skrub it never answers a response pass itself.
         self.feeds_estimator = feeds_estimator
+        # Set by a rewrite that needs this node to emit one response regardless of
+        # the plan mode. A soft-vote child emits probabilities; a hard-vote child
+        # emits labels. Unset, the node follows the plan mode as before.
+        self.response_override = response_override
         # Which responses this op can serve, settled here rather than by a `hasattr` in
         # the execution path. A parameter fed by the graph is still unresolved at this
         # point, so the estimator is taken at its word, as it is in skrub.
@@ -326,10 +330,27 @@ class BaseEstimatorOp(Op):
         An op that cannot serve the requested response falls back the way skrub's
         ``Apply`` does: a transformer transforms, a predictor predicts. So does one
         that feeds another estimator, whatever responses it could serve.
+
+        A response override wins over the plan mode, and only on a response pass.
+        Fitting stays fitting: the override chooses the call made after ``fit``,
+        which is what a parent vote reads.
         """
-        if mode == FITTING_MODE or (mode in self.supported_modes and not self.feeds_estimator):
+        if mode == FITTING_MODE:
+            return mode
+        if mode in RESPONSE_MODES and self.response_override:
+            return self.response_override
+        if mode in self.supported_modes and not self.feeds_estimator:
             return mode
         return self.fallback_mode
+
+    def _response_after_fit(self) -> str:
+        """Method called on the fitted estimator at the end of a fitting pass.
+
+        A response override wins. Otherwise this is ``call_kwargs_key``:
+        ``predict`` for a predictor. A transformer never makes this call; its
+        fitting pass uses ``fit_transform``.
+        """
+        return self.response_override or self.call_kwargs_key
 
     def method_kwargs(self, key: str | None, inputs: list) -> dict:
         """Resolve the kwargs group `key` against `inputs`, as skrub's
@@ -360,6 +381,7 @@ class BaseEstimatorOp(Op):
             kwargs=clone_value(self.kwargs),
             param_refs=self.param_refs,
             feeds_estimator=self.feeds_estimator,
+            response_override=self.response_override,
         )
         new_op.was_cloned = True
         return new_op
@@ -395,8 +417,10 @@ class BaseEstimatorOp(Op):
         # eval set out of the training fold must return placeholders in predict mode).
         fit_kwargs = self.method_kwargs(self.fit_kwargs_key, inputs) if fitting else {}
         # The call group belongs to the method about to run, so a `predict_proba` pass
-        # gets the `predict_proba` group. The fitting pass makes this kind's own call.
-        call_kwargs = self.method_kwargs(self.call_kwargs_key if fitting else mode, inputs)
+        # gets the `predict_proba` group. On a fitting pass that method is the
+        # response override when one is set, and this kind's own call otherwise.
+        response_method = self._response_after_fit()
+        call_kwargs = self.method_kwargs(response_method if fitting else mode, inputs)
         return (
             estm,
             x,
@@ -408,7 +432,8 @@ class BaseEstimatorOp(Op):
             self.unsupervised,
             (fit_kwargs, call_kwargs),
             mode,
-            self.parallelism
+            self.parallelism,
+            response_method,
         )
 
     def process(self, mode: str, inputs: list):
@@ -423,7 +448,9 @@ class BaseEstimatorOp(Op):
 
 class PredictorOp(BaseEstimatorOp):
     logical_family = "Predictor"
-    # fit_transform mode calls fit() then predict(); predict mode only predict().
+    # fit_transform calls fit() then the post-fit response (predict, unless
+    # response_override names another method). A response pass calls that method
+    # only.
     fit_kwargs_key = "fit"
     call_kwargs_key = "predict"
     response_modes = RESPONSE_MODES
@@ -482,7 +509,10 @@ def check_estm_inputs(estimator, mode, x, y):
 
 def process_estimator_task(task_data):
     """ Process a predictor (EstimatorOp) task in a worker process. """
-    (estimator, x, y, cols, exclude_cols, no_wrap, allow_reject, unsupervised, kwargs, mode, parallelism) = task_data
+    (
+        estimator, x, y, cols, exclude_cols, no_wrap, allow_reject, unsupervised,
+        kwargs, mode, parallelism, response_method,
+    ) = task_data
     fit_kwargs, call_kwargs = kwargs
     _, x, y = check_estm_inputs(estimator, mode, x, y)
     if mode == FITTING_MODE:
@@ -490,7 +520,7 @@ def process_estimator_task(task_data):
                                     allow_reject=allow_reject, X=x)
         y_arg = () if unsupervised else (y,)
         estimator.fit(x, *y_arg, **fit_kwargs)
-        result = estimator.predict(x, **call_kwargs)
+        result = getattr(estimator, response_method)(x, **call_kwargs)
         # Return both result and fitted estimator (in case of multi-processing)
         return result, estimator
     elif mode in RESPONSE_MODES:
@@ -501,8 +531,16 @@ def process_estimator_task(task_data):
         raise ValueError(f"Mode {mode} not supported for PredictorOp.")
 
 def process_transformer_task(task_data):
-    """ Process a transformer (TransformerOp) task in a worker process. """
-    (estimator, x, y, cols, exclude_cols, no_wrap, allow_reject, unsupervised, kwargs, mode, parallelism) = task_data
+    """ Process a transformer (TransformerOp) task in a worker process.
+
+    The last item is the post-fit method a predictor calls. A transformer
+    receives it too, and does not use it: fitting calls ``fit_transform`` and
+    a response pass calls ``transform``.
+    """
+    (
+        estimator, x, y, cols, exclude_cols, no_wrap, allow_reject, unsupervised,
+        kwargs, mode, parallelism, _response_method,
+    ) = task_data
     fit_transform_kwargs, transform_kwargs = kwargs
     converted, x, y = check_estm_inputs(estimator, mode, x, y)
     with estimator_parallel_config(parallelism):

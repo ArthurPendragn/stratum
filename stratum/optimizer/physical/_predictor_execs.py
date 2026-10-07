@@ -361,4 +361,5 @@ def lower_predictor(op: PredictorOp, ctx) -> PhysicalOp | None:
         estimator=op.estimator, y=op.y, cols=op.cols, exclude_cols=op.exclude_cols,
         no_wrap=op.no_wrap, allow_reject=op.allow_reject, unsupervised=op.unsupervised,
         kwargs=op.kwargs, param_refs=op.param_refs, feeds_estimator=op.feeds_estimator,
+        response_override=op.response_override,
     )
